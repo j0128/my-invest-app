@@ -11,7 +11,7 @@ st.set_page_config(page_title="Posa x biibo Alpha 2.0 Risk Dashboard", layout="w
 st.title("📈 Posa x biibo Alpha 2.0 投資風險審計儀表板")
 
 # 這裡請填入你的 FRED API Key
-FRED_API_KEY = "9382c202c6133484efb2c1cb571495af"
+FRED_API_KEY = "你的 FRED API Key"
 fred = Fred(api_key=FRED_API_KEY)
 
 # --- 2. 側邊欄：手動輸入區 ---
