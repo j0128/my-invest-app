@@ -4,3 +4,4 @@ pandas
 fredapi
 plotly
 scipy
+scikit-learn
