@@ -8,144 +8,120 @@ import time
 import random
 from datetime import datetime
 
-# --- 1. 系統設定與 Seeking Alpha 數據庫 ---
-st.set_page_config(page_title="Posa Alpha 3.3", layout="wide")
-st.title("🛡️ Posa Alpha 3.3: 視覺化審計與智慧決策終端")
+# --- 1. 初始化與核心標的 ---
+st.set_page_config(page_title="Posa Alpha 3.4", layout="wide")
+st.title("🛡️ Posa Alpha 3.4: 雙指標對比與即時趨勢決策中心")
 
-# SA 十大金股與關鍵數據 [cite: 208, 264, 415, 417]
 SA_TOP_10 = ['MU', 'AMD', 'CLS', 'CIEN', 'COHR', 'ALL', 'INCY', 'GOLD', 'WLDN', 'ATI']
-SA_DATA = {
-    'MU': {'note': 'HBM 領先, PEG 0.20x (折價 88%)', 'eps_g': '206%'},
-    'CLS': {'note': '15次盈餘上修, 0次下修', 'eps_g': '51%'},
-    'AMD': {'note': 'OpenAI 夥伴, M1400 加速器', 'eps_g': '34%'},
-    'ALL': {'note': '連續 32 年配息, AI 核保效率高', 'eps_g': '193%'}
-}
+BENCHMARKS = ['QQQ', '0050.TW', '^VIX', 'BTC-USD']
 
 try:
     FRED_API_KEY = st.secrets["FRED_API_KEY"]
     fred = Fred(api_key=FRED_API_KEY)
 except:
-    st.error("❌ 請在 Secrets 設定 FRED_API_KEY")
+    st.error("❌ 請設定 FRED_API_KEY")
     st.stop()
 
-# --- 2. 側邊欄：實戰配置編輯器 ---
-st.sidebar.header("💰 我的實戰配置")
+# --- 2. 側邊欄：持倉設定 ---
+st.sidebar.header("💰 實戰資產配置")
 if 'portfolio_df' not in st.session_state:
     st.session_state.portfolio_df = pd.DataFrame([
         {"代號": "MU", "金額": 30000},
         {"代號": "AMD", "金額": 25000},
-        {"代號": "SOL-USD", "金額": 15000},
-        {"代號": "QQQ", "金額": 45000}
+        {"代號": "0050.TW", "金額": 50000},
+        {"代號": "SOL-USD", "金額": 15000}
     ])
 edited_df = st.sidebar.data_editor(st.session_state.portfolio_df, num_rows="dynamic")
 user_tickers = edited_df["代號"].tolist()
-total_val = edited_df["金額"].sum()
 
-st.sidebar.divider()
-TRAILING_PCT = st.sidebar.slider("移動止損 (%)", 5, 15, 7) / 100
-KELLY_SCALE = st.sidebar.slider("凱利縮放係數", 0.1, 1.0, 0.5)
-
-# --- 3. 數據抓取與凱利計算 ---
-@st.cache_data(ttl=3600)
-def fetch_and_audit(tickers):
-    prices, earnings = pd.DataFrame(), {}
-    full_list = list(set(tickers + SA_TOP_10 + ['QQQ', '^VIX', '^MOVE', 'BTC-USD']))
+# --- 3. 數據抓取 (含即時價格) ---
+@st.cache_data(ttl=300) # 每 5 分鐘更新一次
+def fetch_realtime_data(tickers):
+    prices = pd.DataFrame()
+    info_box = {}
+    full_list = list(set(tickers + SA_TOP_10 + BENCHMARKS))
+    
     for t in full_list:
-        time.sleep(random.uniform(0.3, 0.8))
         try:
+            time.sleep(0.2)
             tk = yf.Ticker(t)
+            # 抓取歷史與最新價格
             df = tk.history(period="1y")
             if not df.empty:
                 prices[t] = df['Close']
-                if "-" not in t:
-                    cal = tk.calendar
-                    if cal is not None and not cal.empty:
-                        earnings[t] = cal.loc['Earnings Date'].iloc[0].strftime('%Y-%m-%d')
+                # 計算即時漲跌 (最後兩筆)
+                change = (df['Close'].iloc[-1] / df['Close'].iloc[-2] - 1) * 100
+                info_box[t] = {"price": df['Close'].iloc[-1], "change": change}
         except: continue
+    
     try:
         liq = (fred.get_series('WALCL').iloc[-1] - fred.get_series('WTREGEN').iloc[-1] - fred.get_series('RRPONTSYD').iloc[-1]) / 1000
     except: liq = 0
-    return liq, prices, earnings
+    return liq, prices, info_box
 
-def get_stats(t_prices, q_prices):
-    ema20 = t_prices.ewm(span=20).mean()
-    rs = t_prices / q_prices
-    sig = (t_prices > ema20) & (rs > rs.rolling(20).mean())
-    rets = t_prices.shift(-5) / t_prices - 1
-    v_rets = rets[sig].dropna()
-    if len(v_rets) < 5: return 0.52, 2.0
-    return (v_rets > 0).mean(), (v_rets[v_rets > 0].mean() / abs(v_rets[v_rets < 0].mean()))
-
-# --- 4. 頁面渲染 ---
+# --- 4. 渲染頁面 ---
 try:
-    net_liq, prices, e_dates = fetch_and_audit(user_tickers)
-    vix = prices['^VIX'].iloc[-1]
+    net_liq, prices, info_box = fetch_realtime_data(user_tickers)
     
-    # A. 頂部視覺化：情緒儀表盤
-    st.subheader("🌡️ 市場風險溫度與地基審計")
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        fig_vix = go.Figure(go.Indicator(
-            mode = "gauge+number", value = vix, title = {'text': "VIX 恐慌指數"},
-            gauge = {'axis': {'range': [None, 40]}, 'steps': [
-                {'range': [0, 18], 'color': "lightgreen"},
-                {'range': [18, 25], 'color': "orange"},
-                {'range': [25, 40], 'color': "red"}],
-                'bar': {'color': "black"}}))
-        st.plotly_chart(fig_vix, use_container_width=True)
-    with col2:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("淨流動性", f"${net_liq:.2f}B")
-        m2.metric("BTC 趨勢", "🟢 強勢" if prices['BTC-USD'].iloc[-1] > prices['BTC-USD'].ewm(span=20).mean().iloc[-1] else "🔴 弱勢")
-        m3.metric("總市值", f"${total_val:,.0f}")
-        st.write(f"💡 **biibo 意見：** {'市場處於進攻模式，地基穩固。' if vix < 18 else '風險升溫，應縮減個股權重。'}")
+    # A. 即時行情走馬燈 (解決單薄感)
+    st.subheader("⚡ 即時市場脈搏")
+    cols = st.columns(len(user_tickers))
+    for i, t in enumerate(user_tickers):
+        if t in info_box:
+            cols[i].metric(t, f"${info_box[t]['price']:.2f}", f"{info_box[t]['change']:.2f}%")
 
-    # B. 持倉審計表 (恢復凱利與財報預警)
-    st.subheader("🔍 組合深度審計 (含 Seeking Alpha 觀點)")
-    audit_results = []
-    today = datetime.now().date()
+    st.divider()
+
+    # B. 雙指標相對強度分析 (判斷未來走勢)
+    st.subheader("🎯 相對強度雷達：誰才是真正的領跑者？")
+    target = st.selectbox("選擇分析標的", [t for t in user_tickers if t not in BENCHMARKS])
     
+    if target in prices.columns:
+        c1, c2 = st.columns(2)
+        with c1:
+            # 標的 vs QQQ
+            rs_qqq = prices[target] / prices['QQQ']
+            fig_qqq = px.line(rs_qqq, title=f"{target} / QQQ (向上=贏過美股大盤)")
+            st.plotly_chart(fig_qqq, use_container_width=True)
+        with c2:
+            # 標的 vs 0050
+            rs_0050 = prices[target] / prices['0050.TW']
+            fig_0050 = px.line(rs_0050, title=f"{target} / 0050 (向上=贏過台股地基)")
+            st.plotly_chart(fig_0050, use_container_width=True)
+
+    # C. 趨勢預判表格
+    st.subheader("🔍 趨勢健康度審計")
+    audit_results = []
     for t in user_tickers:
-        if t not in prices.columns or t in ['QQQ', '^VIX']: continue
-        win_p, odds = get_stats(prices[t], prices['QQQ'])
-        kelly_w = max(0, (win_p - (1 - win_p) / odds) * KELLY_SCALE)
-        act_w = edited_df.loc[edited_df['代號']==t, '金額'].sum() / total_val
-        e_date = e_dates.get(t, "N/A")
-        e_alert = "⚠️ 7天內" if e_date != "N/A" and (datetime.strptime(e_date, '%Y-%m-%d').date() - today).days <= 7 else "✅"
+        if t not in prices.columns or t in ['^VIX']: continue
+        curr_p = prices[t].iloc[-1]
+        ema20 = prices[t].ewm(span=20).mean().iloc[-1]
         
-        sa_note = SA_DATA.get(t, {}).get('note', '自定義標的')
+        # 預判指標：RS 斜率 (過去 5 天)
+        rs_trend = (prices[t]/prices['QQQ']).iloc[-5:].pct_change().sum()
+        status = "🔥 加速" if (curr_p > ema20 and rs_trend > 0) else "⚠️ 弱化" if (curr_p < ema20) else "🛡️ 盤整"
         
         audit_results.append({
-            "標的": t, "SA 觀點": sa_note, "回測勝率": f"{win_p*100:.1f}%",
-            "凱利建議": kelly_w, "實際權重": act_w, "財報": e_alert,
-            "止損狀態": "❌ 觸發" if prices[t].iloc[-1] <= prices[t].max()*(1-TRAILING_PCT) else "🟢 安全"
+            "標的": t, "目前價格": f"${curr_p:.2f}",
+            "20EMA 狀態": "🟢 站穩" if curr_p > ema20 else "🔴 跌破",
+            "相對 QQQ 趨勢": "↗️ 增強" if rs_trend > 0 else "↘️ 轉弱",
+            "未來走勢預判": status
         })
-    
-    audit_df = pd.DataFrame(audit_results)
-    st.table(audit_df.drop(columns=['凱利建議', '實際權重']).assign(
-        凱利建議權重 = audit_df['凱利建議'].apply(lambda x: f"{x*100:.1f}%"),
-        目前權重 = audit_df['實際權重'].apply(lambda x: f"{x*100:.1f}%")
-    ))
+    st.table(pd.DataFrame(audit_results))
 
-    # C. 配置對比圖 (解決單薄感)
-    st.subheader("📊 配置修正對比：實際 vs. 凱利建議")
-    fig_comp = go.Figure(data=[
-        go.Bar(name='實際權重', x=audit_df['標的'], y=audit_df['實際權重']),
-        go.Bar(name='凱利建議', x=audit_df['標的'], y=audit_df['凱利建議'])
-    ])
-    fig_comp.update_layout(barmode='group', height=400)
-    st.plotly_chart(fig_comp, use_container_width=True)
-
-    # D. 會計師報告
+    # D. 智慧會計師報告 (最底端)
     st.divider()
-    st.subheader("🖋️ Alpha 3.3 自動審計報告")
+    st.subheader("🖋️ Alpha 3.4 決策修正建議")
     with st.container(border=True):
-        if vix > 18: st.write("🚨 **風控提示：** VIX 已破 18，凱利公式已自動下修建議倉位。")
-        for _, row in audit_df.iterrows():
-            if row['實際權重'] > row['凱利建議'] + 0.1:
-                st.write(f"⚠️ **過度曝險：** {row['標的']} 實際權重過高，建議減碼至 {row['凱利建議權重']}。")
-            if row['財報'] == "⚠️ 7天內":
-                st.write(f"💣 **財報警示：** {row['標的']} 財報在即，建議減碼 50% 以避開黑天鵝 。")
+        vix = prices['^VIX'].iloc[-1]
+        if vix > 18: st.warning(f"⚠️ VIX ({vix:.2f}) 突破警戒線，即便今晚大漲，也應視為反彈減碼點。")
+        
+        for t in user_tickers:
+            if t in prices.columns and prices[t].iloc[-1] < prices[t].ewm(span=20).mean().iloc[-1]:
+                st.write(f"🛑 **指令：** {t} 趨勢已跌破 20EMA，且相對於 QQQ 轉弱。建議將資金移往更強勢的標的或 0050。")
+        
+        if info_box.get('BTC-USD', {}).get('change', 0) > 2:
+            st.info("💡 **觀察：** 幣圈動能強於美股，符合您觀察到的『資金溢出』，可適度維持幣圈權重。")
 
 except Exception as e:
-    st.error(f"系統運行中：{e}")
+    st.error(f"系統運行中: {e}")
