@@ -66,11 +66,11 @@ def calculate_predictions(series):
 
 # --- 4. 側邊欄：實戰輸入 form ---
 with st.sidebar.form("alpha_form"):
-    st.header("💰 12.7萬資金部署")
+    st.header("💰 資金部署")
     if 'portfolio_df' not in st.session_state:
         st.session_state.portfolio_df = pd.DataFrame([
-            {"代號": "MU", "金額": 30000}, {"代號": "AMD", "金額": 25000},
-            {"代號": "URA", "金額": 15000}, {"代號": "BTC-USD", "金額": 57000}
+            {"代號": "AMD", "金額": 30000}, {"代號": "URA", "金額": 25000},
+            {"代號": "SOL-USD", "金額": 15000}, {"代號": "BTC-USD", "金額": 57000}
         ])
     edited_df = st.data_editor(st.session_state.portfolio_df, num_rows="dynamic")
     submit = st.form_submit_button("🚀 執行全方位審計與預判")
