@@ -16,6 +16,7 @@ st.markdown("""
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
+    .formula-box {background-color: #1E1E1E; padding: 15px; border-radius: 10px; border-left: 5px solid #FFD700;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -199,18 +200,21 @@ def parse_input(input_text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 戰略資產中控台")
-    st.caption("v13.0 防撞版 | 修復 Duplicate Element ID 錯誤")
+    st.caption("v14.0 白皮書版 | 包含量化模型公式說明")
     st.markdown("---")
 
     # --- 側邊欄 ---
     with st.sidebar:
         st.header("⚙️ 資產配置輸入")
         st.caption("格式：代號, 持倉金額")
-        default_input = """BTC-USD, 50000
-QQQ, 30000
-BNSOL-USD, 15000
-0050.TW, 20000
-NVDA, 10000"""
+        # [更新] 預設持倉更新為用戶指定的列表
+        default_input = """BTC-USD, 70000
+BNSOL-USD, 130000
+ETH-USD, 10000
+0050.TW, 95000
+AMD, 65000
+CLS, 15000
+URA, 35000"""
         user_input = st.text_area("持倉清單", default_input, height=200)
         portfolio_dict = parse_input(user_input)
         tickers_list = list(portfolio_dict.keys())
@@ -268,16 +272,13 @@ NVDA, 10000"""
     st.markdown("---")
     st.markdown("#### 🇺🇸 美國大盤基準 K 線")
     
-    # [關鍵修復]：加入 unique key 防止 ID 衝突
     b_col1, b_col2, b_col3 = st.columns(3)
     benchmarks = ['QQQ', 'QLD', 'TQQQ']
     for i, b_ticker in enumerate(benchmarks):
         with [b_col1, b_col2, b_col3][i]:
             if b_ticker in df_close.columns:
                 fig = plot_kline_chart(b_ticker, df_close, df_open, df_high, df_low)
-                if fig: 
-                    # 這裡加上了 key=f"bench_{b_ticker}"，這是修復的關鍵！
-                    st.plotly_chart(fig, use_container_width=True, key=f"bench_{b_ticker}")
+                if fig: st.plotly_chart(fig, use_container_width=True, key=f"bench_{b_ticker}")
 
     st.markdown("---")
 
@@ -321,7 +322,6 @@ NVDA, 10000"""
             pie_df = pd.DataFrame(list(portfolio_dict.items()), columns=['Ticker', 'Value'])
             fig = px.pie(pie_df, values='Value', names='Ticker', title='資產配置', hole=0.4)
             fig.update_layout(margin=dict(t=30, b=0, l=0, r=0), height=300)
-            # 這裡也加個 key 保險
             st.plotly_chart(fig, use_container_width=True, key="portfolio_pie")
 
     st.markdown("---")
@@ -339,9 +339,7 @@ NVDA, 10000"""
             
             with k_col1:
                 fig = plot_kline_chart(ticker, df_close, df_open, df_high, df_low)
-                if fig: 
-                    # [關鍵修復]：這裡加上 key=f"deep_{ticker}"，防止跟上面的圖撞車！
-                    st.plotly_chart(fig, use_container_width=True, key=f"deep_{ticker}")
+                if fig: st.plotly_chart(fig, use_container_width=True, key=f"deep_{ticker}")
                 
             with k_col2:
                 st.markdown("#### 六維數據")
@@ -353,6 +351,76 @@ NVDA, 10000"""
                 st.divider()
                 st.markdown("#### Alpha 預測")
                 st.metric("1個月目標", f"${trend['p_1m']:.2f}", delta=f"{(trend['p_1m']-trend['p_now'])/trend['p_now']:.1%}")
+
+    st.markdown("---")
+
+    # --- D. 量化模型白皮書 (New Section) ---
+    st.header("4. 量化模型白皮書 (Quantitative Logic & Formulas)")
+    st.markdown("本系統採用之核心算法與邏輯說明：")
+
+    with st.container():
+        st.markdown("#### 📐 1. 趨勢判定模型 (Trend Model)")
+        st.info("""
+        **質性解釋：** 我們不猜測市場，而是追隨資金慣性。當價格站上「機構生命線 (20EMA)」且趨勢斜率向上時，代表大資金正在進場，此時為「加速進攻」階段。
+        """)
+        st.latex(r'''
+        Status = \begin{cases} 
+        \text{🔥 加速進攻 (Bullish)}, & \text{if } P_{now} > EMA_{20} \text{ and } Slope(k) > 0 \\
+        \text{🛑 趨勢損毀 (Bearish)}, & \text{if } P_{now} < EMA_{20} \\
+        \text{🛡️ 區間盤整 (Neutral)}, & \text{otherwise}
+        \end{cases}
+        ''')
+
+        st.divider()
+
+        st.markdown("#### 🎲 2. 凱利公式倉位建議 (Kelly Criterion)")
+        st.info("""
+        **質性解釋：** 這是賭場與避險基金共用的資金管理神器。它根據「勝率」與「賠率」計算出數學上最優的下注比例。為了安全，本系統採用「半凱利 (Half-Kelly)」以降低波動。
+        """)
+        st.latex(r'''
+        f^* = \frac{p(b+1)-1}{b} \times 0.5
+        ''')
+        st.markdown("""
+        * $f^*$: 建議持倉比例 (Optimal Fraction)
+        * $p$: 勝率 (Win Rate, 系統預設 55%，若趨勢向上則 +5%)
+        * $b$: 賠率 (Odds, 系統預設盈虧比 2.0)
+        """)
+
+        st.divider()
+
+        st.markdown("#### 🛡️ 3. 六維波動防禦區間 (Six-Sigma Volatility)")
+        st.info("""
+        **質性解釋：** 價格永遠在均值附近波動。我們利用統計學標準差 ($\sigma$) 劃出價格的「極限邊界」。H2 通常是過熱區，L2 通常是超賣區。
+        """)
+        st.latex(r'''
+        \text{Upper Band } (H_n) = \mu_{20} + (n \times \sigma_{20}) \\
+        \text{Lower Band } (L_n) = \mu_{20} - (n \times \sigma_{20})
+        ''')
+        st.markdown("* $n \in \{1, 2, 3\}$ 代表標準差倍數。")
+
+        st.divider()
+
+        st.markdown("#### 🔮 4. 未來價格預測 (Linear Projection)")
+        st.info("""
+        **質性解釋：** 基於動量守恆定律，假設目前的趨勢慣性在未來一個月內不變，利用最小平方法 (OLS) 推導出的理論目標價。
+        """)
+        st.latex(r'''
+        P_{t+22} = \alpha + \beta(t+22)
+        ''')
+        st.markdown("* $t+22$: 代表未來一個月 (約 22 個交易日)。")
+
+        st.divider()
+        
+        st.markdown("#### ₿ 5. 比特幣 Pi Cycle 逃頂指標")
+        st.info("""
+        **質性解釋：** 歷史上最準確的 BTC 逃頂指標。當短週期均線 (111DMA) 上穿長週期均線的兩倍 (350DMA x 2) 時，通常對應市場極度瘋狂的頂部。
+        """)
+        st.latex(r'''
+        Signal = \begin{cases} 
+        \text{🚨 SELL}, & \text{if } MA_{111} > (MA_{350} \times 2) \\
+        \text{✅ HOLD}, & \text{otherwise}
+        \end{cases}
+        ''')
 
 if __name__ == "__main__":
     main()
