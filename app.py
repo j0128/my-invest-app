@@ -9,60 +9,77 @@ from datetime import datetime, date, timedelta
 # --- 2026 核心配置 ---
 FRED_API_KEY = "你的_FRED_API_KEY_在此" 
 
-# 1. 財報日自動查詢模組 (2026 預測)
-def get_auto_earnings(ticker):
-    schedule = {
-        'AMD': '2026-01-27', 'NVDA': '2026-02-25', 'TSM': '2026-01-16',
-        'QQQ': '2026-01-29', 'AAPL': '2026-01-30', 'MSFT': '2026-01-27'
-    }
-    return schedule.get(ticker.upper(), "2026-02-15")
+@st.cache_resource
+def get_fred_client(api_key):
+    try:
+        if "你的" in api_key: return None
+        return Fred(api_key=api_key)
+    except: return None
 
-# 2. 數據洗滌模組 (解決 MultiIndex 與 KeyError 關鍵) [19, 20]
+fred_client = get_fred_client(FRED_API_KEY)
+
+# 1. 數據清洗模組：強力處理 MultiIndex 與 NaN
 def module_integrity(df_raw):
     df = df_raw.copy()
-    # 強制扁平化索引：解決「選了 QQQ 卻報錯」的關鍵
+    # 解決 image_4f476c 的 KeyError: 強制扁平化 yfinance 下載的多層索引
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
+        if 'Adj Close' in df.columns.levels[0]:
+            df = df['Adj Close']
+        else:
+            df.columns = df.columns.get_level_values(-1)
     
     df = df.ffill().dropna(how='all')
+    # 解決 image_4fb011: 確保 QQQ 存在且名稱正確
     if 'QQQ' not in df.columns:
-        return None, "❌ 基準缺失：請務必在左側監控資產中勾選 QQQ。"
+        return None, "❌ 基準缺失：請務必在左側監控資產中勾選 QQQ"
     
     clean_df = df.replace([np.inf, -np.inf], np.nan).dropna()
     return clean_df, None
 
-# 3. 核心運算模組 (k, eff, p1, p3, 20EMA) [1, 2, 3, 4, 5, A]
-def module_core_logic(df):
+# 2. 趨勢與預測模組：解決 image_50190a 的 Series 比較報錯
+def module_projection(df):
     y = df['QQQ'].values.reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
     model = LinearRegression().fit(x, y)
     
     k, eff = model.coef_[0][0], model.score(x, y)
     ts_p = model.predict(x).flatten()
-    p1 = model.predict([[len(y) + 22]])[0][0]
-    p3 = model.predict([[len(y) + 66]])[0][0]
+    p1 = float(model.predict([[len(y) + 22]])[0][0])
     
-    ema20 = df['QQQ'].ewm(span=20).mean()
-    status = "🔥 加速上升" if y[-1][0] > ema20.iloc[-1] and k > 0 else "🛡️ 區間盤整"
-    if y[-1][0] < ema20.iloc[-1]: status = "🛑 趨勢損毀"
+    ema20_series = df['QQQ'].ewm(span=20).mean()
+    curr_p = float(y[-1][0])
+    last_ema = float(ema20_series.iloc[-1])
     
-    return {"k": k, "eff": eff, "p1": p1, "p3": p3, "ts_p": ts_p, "status": status, "ema20": ema20}
+    # 修正 Series 比較邏輯：使用標量比較，防止 ValueError
+    if curr_p > last_ema and k > 0:
+        status = "🔥 加速上升"
+    elif curr_p < last_ema:
+        status = "🛑 趨勢損毀"
+    else:
+        status = "🛡️ 區間盤整"
+    
+    return {"k": k, "eff": eff, "p1": p1, "ts_p": ts_p, "status": status, "ema20": ema20_series}
 
-# 4. 組合審計模組 (解決 ValueError: identically-labeled Series) [12, 13, 21]
-def module_portfolio_audit(df, core, investments):
+# 3. 組合審計模組：解決 image_501165 的分母與標籤比較報錯
+def module_portfolio(df, core, investments):
     rets_df = df.pct_change().dropna()
-    # 關鍵修正：將 DataFrame Sum 轉為純標量字典
+    # 關鍵修正：將所有 Series 轉換為標量字典
     rets_sum = rets_df.sum().to_dict()
-    eps = 1e-12
+    eps = 1e-12 
     
-    target_ticker = [a for a in investments.keys() if a != 'QQQ'][0] if len(investments) > 1 else 'QQQ'
+    target = [a for a in investments.keys() if a != 'QQQ'][0] if len(investments) > 1 else 'QQQ'
     
-    val_target = float(rets_sum.get(target_ticker, 0))
+    val_target = float(rets_sum.get(target, 0))
     val_qld = float(rets_sum.get('QLD', eps))
     val_tqqq = float(rets_sum.get('TQQQ', eps))
     
-    # 純標量比較，徹底解決 Pandas 報錯
-    grade = "Alpha+" if val_target > val_tqqq else ("Beta+" if val_target > val_qld else "Underperform")
+    # 純標量數值比較，徹底根除 Pandas 報錯
+    if val_target > val_tqqq:
+        grade = "Alpha+"
+    elif val_target > val_qld:
+        grade = "Beta+"
+    else:
+        grade = "Underperform"
     
     total_cap = sum(investments.values()) if sum(investments.values()) > 0 else 1
     kelly = np.clip(((0.6 if core['k'] > 0 else 0.4) - 0.4) / 1, 0, 0.75)
@@ -70,10 +87,29 @@ def module_portfolio_audit(df, core, investments):
     std = np.std(df['QQQ'].values - core['ts_p'].reshape(-1, 1))
     shells = {f'L{i}': core['p1'] - i*std for i in range(1, 4)}
     
-    return {"grade": grade, "pQ": core['eff'] * (val_target / (val_qld + eps)), "kelly": kelly, "shells": shells, "target": target_ticker, "total": total_cap}
+    return {"grade": grade, "kelly": kelly, "shells": shells, "target": target, "total": total_cap}
 
-# --- UI 介面實作 ---
-st.set_page_config(page_title="Alpha 2.0 Quant", layout="wide")
+# 4. 外部因子模組
+def module_external(df, fred, exit_date_obj):
+    res = {"btc_corr": 0, "pi_top": False, "imp_score": 2.1, "fed_rate": 4.75}
+    if 'BTC-USD' in df.columns:
+        res['btc_corr'] = df['QQQ'].pct_change().corr(df['BTC-USD'].pct_change())
+        ma111 = df['BTC-USD'].rolling(111).mean().iloc[-1]
+        ma350_2 = df['BTC-USD'].rolling(350).mean().iloc[-1] * 2
+        res['pi_top'] = bool(ma111 > ma350_2)
+    
+    if fred:
+        try:
+            res['fed_rate'] = fred.get_series('FEDFUNDS').iloc[-1]
+            res['imp_score'] = abs(res['fed_rate'] - 4.5) * 1.5
+        except: pass
+    
+    today = date(2026, 1, 15)
+    res['exit_factor'] = np.clip((exit_date_obj - today).days / 136, 0, 1)
+    return res
+
+# --- UI 介面 ---
+st.set_page_config(page_title="Alpha 2.0 Strategic Audit", layout="wide")
 st.sidebar.header("🎯 進攻調度中心 (2026)")
 
 with st.sidebar.form("audit_form"):
@@ -82,43 +118,41 @@ with st.sidebar.form("audit_form"):
     investments = {}
     for asset in monitored:
         investments[asset] = st.number_input(f"{asset} 持倉 (USD)", min_value=0, value=1000)
-    exit_date = st.date_input("2026 清倉日", value=date(2026, 5, 31))
+    exit_in = st.date_input("2026 清倉日", value=date(2026, 5, 31))
     submit = st.form_submit_button("🚀 執行進攻型深度審計")
 
 st.title("🚀 Alpha 2.0 進攻型深度審計 (2026 版)")
 
 if submit:
-    # 修正下載邏輯，確保獲取 Adj Close
     raw_data = yf.download(monitored, start="2024-01-01", end="2026-01-16")
     
     if not raw_data.empty:
         clean, err = module_integrity(raw_data)
         if not err:
-            core = module_core_logic(clean)
-            res = module_portfolio_audit(clean, core, investments)
+            core = module_projection(clean)
+            port = module_portfolio(clean, core, investments)
+            ext = module_external(clean, fred_client, exit_in)
             
-            # 第一排：核心指標
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("進攻斜率 (k)", f"{core['k']:.2f}", delta=core['status'])
-            c2.metric("自動財報日", get_auto_earnings(res['target']))
+            c2.metric("趨勢純度 (eff)", f"{core['eff']:.2%}")
             c3.metric("1M 預測價", f"${core['p1']:.2f}")
-            c4.metric("總曝險金額", f"${res['total']:,.0f}")
+            c4.metric("總持倉價值", f"${port['total']:,.0f}")
             
             st.divider()
-            
-            # 第二排：圖表分析
             col_l, col_r = st.columns(2)
             with col_l:
-                st.subheader(f"📊 選股等級：{res['grade']}")
-                st.bar_chart(pd.DataFrame({k: [v/res['total']] for k,v in investments.items()}).T)
-                st.write(f"當前針對 **{res['target']}** 進行 Alpha 審計。")
+                st.subheader(f"📊 選股等級：{port['grade']}")
+                w_df = pd.DataFrame({k: [v/port['total']] for k,v in investments.items()}).T
+                st.bar_chart(w_df)
+                st.write(f"針對 **{port['target']}** 進行對標審計。")
             with col_r:
-                st.subheader("📈 QQQ 趨勢生命線 (20EMA)")
-                plot_df = pd.DataFrame({"實際價格": clean['QQQ'][-60:], "預測趨勢": core['ts_p'][-60:]})
+                st.subheader("📈 QQQ 趨勢生命線")
+                plot_df = pd.DataFrame({"實際價格": clean['QQQ'][-60:].values, "預測趨勢": core['ts_p'][-60:]})
                 st.line_chart(plot_df)
             
-            st.info(f"📍 審計結論：目前進攻動能充足。距離 2026/05 撤退日剩餘 {(exit_date - date(2026,1,15)).days} 天。")
+            st.info(f"📍 審計結論：撤退倒數中，剩餘因子: {ext['exit_factor']:.2%} | BTC Pi-Cycle: {'⚠️ 頂部' if ext['pi_top'] else '✅ 安全'}")
         else:
             st.error(err)
 else:
-    st.info("請在左側輸入資產金額，並確保選中 **QQQ** 後按下確認鍵。")
+    st.info("請在左側輸入資產持倉，按下確認鍵啟動量化引擎。")
