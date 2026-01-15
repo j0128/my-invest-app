@@ -98,6 +98,7 @@ def run_quantum_audit(series, qld_prices):
         "kelly": kelly, "win_p": win_p, 
         "range_1w": (curr - move_1w, curr + move_1w),
         "pred_1m": pred_1m, "t_stop": t_stop, "eff": efficiency
+    }
 
 # --- 4. 側邊欄：實戰輸入 Form (功能 5, 20) ---
 with st.sidebar.form("posa_input_form"):
@@ -177,7 +178,6 @@ if submit_btn or st.session_state.prices is not None:
             cp = prices[t].iloc[-1]
             chg = (prices[t].iloc[-1]/prices[t].iloc[-2]-1)*100
             cols[j].metric(t, f"${cp:,.2f}", f"{chg:.2f}%")
-    
 
 # --- 9. 深度審計大表 (功能 7, 8, 10, 13, 14, 17) ---
     st.divider()
@@ -273,7 +273,7 @@ if submit_btn or st.session_state.prices is not None:
 
     # --- 12. 旗艦決策手冊 (功能 15) ---
     st.divider()
-    with st.expander("📚 Posa 旗艦審計決策手冊 (20項全功能判斷依據)"):
+    with st.expander("📚 Posa 旗艦審計決策手冊"):
         st.markdown(f"""
         ### 1. 趨勢與預判邏輯 (Future Forecast)
         * **1w Expected Move (一週預測)**：基於 Black-Scholes 模型：$Price \pm (Price \times \sigma \times \sqrt{{7/365}})$. 
