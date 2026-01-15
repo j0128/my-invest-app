@@ -2,12 +2,14 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from fredapi import Fred
 from sklearn.linear_model import LinearRegression
 import plotly.express as px
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 2.0 Pro: 戰略資產中控台", layout="wide", page_icon="🏛️")
+st.set_page_config(page_title="Alpha 2.0 Pro: 資金雷達戰情室", layout="wide", page_icon="📡")
 
 # 自定義 CSS
 st.markdown("""
@@ -16,115 +18,143 @@ st.markdown("""
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
-    .warning {color: #FFA500; font-weight: bold;}
+    .liquidity-box {border-left: 5px solid #00BFFF; background-color: #001f3f; padding: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 ---
+# --- 1. 核心數據引擎 (OHLCV + FRED) ---
 @st.cache_data(ttl=3600)
-def fetch_data(tickers):
-    benchmarks = ['QQQ', 'QLD', 'TQQQ', 'BTC-USD', '^VIX', '^TNX', 'HYG'] 
+def fetch_market_data(tickers):
+    """
+    抓取 OHLCV (含成交量) 用於計算資金流
+    """
+    benchmarks = ['QQQ', 'QLD', 'TQQQ', 'BTC-USD', '^VIX', '^TNX', 'HYG']
     all_tickers = list(set(tickers + benchmarks))
     
-    dict_close = {}
-    dict_open = {}
-    dict_high = {}
-    dict_low = {}
+    data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
     
-    progress_bar = st.progress(0, text="Alpha 正在建立全市場連線...")
+    progress_bar = st.progress(0, text="Alpha 正在掃描全市場資金流向...")
     
     for i, t in enumerate(all_tickers):
         try:
             progress_bar.progress((i + 1) / len(all_tickers), text=f"正在下載: {t} ...")
             df = yf.Ticker(t).history(period="2y", auto_adjust=True)
             if df.empty: continue
-            dict_close[t] = df['Close']
-            dict_open[t] = df['Open']
-            dict_high[t] = df['High']
-            dict_low[t] = df['Low']
+            
+            data['Close'][t] = df['Close']
+            data['Open'][t] = df['Open']
+            data['High'][t] = df['High']
+            data['Low'][t] = df['Low']
+            data['Volume'][t] = df['Volume']
         except: continue
             
     progress_bar.empty()
-    return (pd.DataFrame(dict_close).ffill(), 
-            pd.DataFrame(dict_open).ffill(), 
-            pd.DataFrame(dict_high).ffill(), 
-            pd.DataFrame(dict_low).ffill())
+    return (pd.DataFrame(data['Close']).ffill(), 
+            pd.DataFrame(data['Open']).ffill(), 
+            pd.DataFrame(data['High']).ffill(), 
+            pd.DataFrame(data['Low']).ffill(),
+            pd.DataFrame(data['Volume']).ffill())
 
-# --- 2. 估值 ---
 @st.cache_data(ttl=3600*12)
-def get_valuation_metrics(ticker):
+def fetch_fred_liquidity(api_key):
+    """
+    抓取真實美元流動性 (Fed Balance Sheet - TGA - RRP)
+    """
+    if not api_key: return None
     try:
-        info = yf.Ticker(ticker).info
-        return info.get('forwardPE', None)
+        fred = Fred(api_key=api_key)
+        # WALCL: Fed總資產, WTREGEN: 財政部TGA帳戶, RRPONTSYD: 逆回購
+        walcl = fred.get_series('WALCL', observation_start='2024-01-01')
+        tga = fred.get_series('WTREGEN', observation_start='2024-01-01')
+        rrp = fred.get_series('RRPONTSYD', observation_start='2024-01-01')
+        
+        # 數據頻率不同，需對齊 (以週為單位 forward fill)
+        df = pd.DataFrame({'WALCL': walcl, 'TGA': tga, 'RRP': rrp}).ffill().dropna()
+        
+        # 計算淨流動性 (單位：十億美元)
+        df['Net_Liquidity'] = (df['WALCL'] - df['TGA'] - df['RRP']) / 1000 
+        return df
     except: return None
 
-# --- 3. 趨勢模組 (含乖離判斷) ---
+# --- 2. 資金流向指標 (OBV & MFI) ---
+def calc_fund_flow(close, high, low, volume):
+    if volume is None or volume.empty: return None
+    
+    # 1. OBV (On-Balance Volume)
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    
+    # 計算 OBV 趨勢 (斜率)
+    y = obv.values[-20:].reshape(-1, 1) # 看過去 20 天
+    x = np.arange(len(y)).reshape(-1, 1)
+    obv_slope = LinearRegression().fit(x, y).coef_[0].item()
+    
+    # 2. MFI (Money Flow Index)
+    typical_price = (high + low + close) / 3
+    money_flow = typical_price * volume
+    
+    positive_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
+    negative_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0)
+    
+    # 14天週期
+    pos_sum = pd.Series(positive_flow).rolling(14).sum().iloc[-1]
+    neg_sum = pd.Series(negative_flow).rolling(14).sum().iloc[-1]
+    
+    if neg_sum == 0: mfi = 100
+    else:
+        mfi_ratio = pos_sum / neg_sum
+        mfi = 100 - (100 / (1 + mfi_ratio))
+        
+    return {"obv_slope": obv_slope, "mfi": mfi, "obv_series": obv}
+
+# --- 3. 趨勢與估值 ---
 def analyze_trend(series):
     if series is None: return None
     series = series.dropna()
-    if series.empty or len(series) < 200: return None
+    if len(series) < 200: return None
 
     y = series.values.reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
-    
     model = LinearRegression().fit(x, y)
-    k = model.coef_[0].item()
-    r2 = model.score(x, y)
     
     p_now = series.iloc[-1].item()
     p_1m = model.predict([[len(y) + 22]])[0].item()
+    k = model.coef_[0].item()
     
     ema20 = series.ewm(span=20).mean().iloc[-1].item()
     sma200 = series.rolling(200).mean().iloc[-1].item()
     
     status = "🛡️ 區間盤整"
-    color = "neutral"
+    if p_now < sma200: status = "🛑 熊市防禦"
+    elif p_now > ema20 and k > 0: status = "🔥 加速進攻"
+    elif p_now < ema20: status = "⚠️ 動能減弱"
+        
+    is_overheated = (k > 0 and p_1m < p_now)
     
-    if p_now < sma200:
-        status = "🛑 熊市防禦 (破年線)"
-        color = "bearish"
-    elif p_now > ema20 and k > 0:
-        status = "🔥 加速進攻"
-        color = "bullish"
-    elif p_now < ema20:
-        status = "⚠️ 動能減弱"
-        color = "neutral"
-        
-    # [新增] 乖離率過大判斷
-    is_overheated = False
-    if k > 0 and p_1m < p_now:
-        is_overheated = True
-        
-    return {
-        "k": k, "r2": r2, "p_now": p_now, "p_1m": p_1m, 
-        "ema20": ema20, "sma200": sma200, 
-        "status": status, "color": color,
-        "is_overheated": is_overheated # 回傳乖離狀態
-    }
+    return {"k": k, "p_now": p_now, "p_1m": p_1m, "ema20": ema20, "sma200": sma200, 
+            "status": status, "is_overheated": is_overheated}
 
-# --- 4. 六維波動 ---
+@st.cache_data(ttl=3600*12)
+def get_valuation_metrics(ticker):
+    try: return yf.Ticker(ticker).info.get('forwardPE', None)
+    except: return None
+
 def calc_volatility_shells(series):
-    if series is None or series.empty: return {}, "無數據"
     try:
         window = 20
-        rolling_mean = series.rolling(window).mean().iloc[-1].item()
-        rolling_std = series.rolling(window).std().iloc[-1].item()
-        curr_price = series.iloc[-1].item()
+        mean = series.rolling(window).mean().iloc[-1]
+        std = series.rolling(window).std().iloc[-1]
+        p = series.iloc[-1]
+        levels = {f'H{i}': mean + i*std for i in range(1,4)}
+        levels.update({f'L{i}': mean - i*std for i in range(1,4)})
         
-        levels = {}
-        for i in range(1, 4):
-            levels[f'H{i}'] = rolling_mean + (i * rolling_std)
-            levels[f'L{i}'] = rolling_mean - (i * rolling_std)
-            
-        pos_desc = "正常波動"
-        if curr_price > levels.get('H2', 999999): pos_desc = "⚠️ 情緒過熱 (H2)"
-        if curr_price < levels.get('L2', -999999): pos_desc = "💎 超賣機會 (L2)"
-        
-        return levels, pos_desc
+        status = "正常波動"
+        if p > levels['H2']: status = "⚠️ 情緒過熱 (H2)"
+        if p < levels['L2']: status = "💎 超賣機會 (L2)"
+        return levels, status
     except: return {}, "計算錯誤"
 
-# --- 5. 決策引擎 ---
-def determine_strategy_gear(qqq_trend, vix_now, qqq_pe, hyg_trend):
+# --- 4. 決策金字塔 ---
+def determine_strategy_gear(qqq_trend, vix_now, qqq_pe, hyg_trend, net_liquidity_trend):
     if not qqq_trend: return "N/A", "數據不足"
     price = qqq_trend['p_now']
     sma200 = qqq_trend['sma200']
@@ -132,61 +162,50 @@ def determine_strategy_gear(qqq_trend, vix_now, qqq_pe, hyg_trend):
     vix = vix_now if vix_now else 20
     pe = qqq_pe if qqq_pe else 25 
     
+    # 1. 真實流動性濾網 (FED Net Liquidity)
+    if net_liquidity_trend == "收縮":
+        return "檔位 1 (QQQ)", "💧 聯準會縮表：淨流動性下降，市場缺乏燃料。禁止高槓桿。"
+
+    # 2. 替代流動性濾網 (HYG)
     if hyg_trend and hyg_trend['p_now'] < hyg_trend['sma200']:
-        return "檔位 0 (現金/避險)", "💧 流動性枯竭：HYG 跌破年線，強制防禦。"
-    if price < sma200:
-        return "檔位 0 (現金/避險)", "🛑 熊市訊號：QQQ 跌破年線，多頭禁入。"
-    if pe > 32:
-        return "檔位 1 (QQQ)", "⚠️ 估值天花板：PE > 32，禁止槓桿。"
-    if vix > 22:
-        return "檔位 1 (QQQ)", "🌩️ 風暴警報：VIX > 22，禁止槓桿。"
-    if pe > 28:
-        if price > ema20: return "檔位 2 (QLD)", "⚖️ 估值偏高：限制 2倍槓桿。"
-        else: return "檔位 1 (QQQ)", "📉 動能不足：短期轉弱。"
-    if price > ema20:
-        return "檔位 3 (TQQQ)", "🚀 完美風口：流動性足 + 估值合理 + 趨勢向上。"
-    else:
-        return "檔位 2 (QLD)", "🛡️ 趨勢回調：牛市回檔，保持 2倍。"
+        return "檔位 0 (現金)", "💔 信用破裂：高收益債跌破年線，系統性風險極高。"
 
-# --- 6. 凱利公式 ---
-def calc_kelly_position(trend_data):
-    if not trend_data: return 0, 0
-    win_rate = 0.55
-    if trend_data['k'] > 0: win_rate += 0.05
-    if trend_data['r2'] > 0.6: win_rate += 0.05
-    if "熊市" in trend_data['status']: win_rate -= 0.2
-    f_star = (2.0 * win_rate - (1 - win_rate)) / 2.0
-    return max(0, f_star * 0.5) * 100, win_rate
+    # 3. 趨勢與估值
+    if price < sma200: return "檔位 0 (現金)", "🛑 熊市：跌破年線。"
+    if pe > 32: return "檔位 1 (QQQ)", "⚠️ 估值天花板：PE > 32。"
+    if vix > 22: return "檔位 1 (QQQ)", "🌩️ VIX 恐慌模式。"
+    
+    # 4. 進攻
+    if price > ema20: return "檔位 3 (TQQQ)", "🚀 完美風口：流動性充裕 + 趨勢向上。"
+    return "檔位 2 (QLD)", "🛡️ 牛市回調：保持中度槓桿。"
 
-# --- 7. 比特幣逃頂 ---
-def check_pi_cycle(btc_series):
-    if btc_series.empty: return False, 0, 0, 0
-    ma111 = btc_series.rolling(111).mean().iloc[-1]
-    ma350_x2 = btc_series.rolling(350).mean().iloc[-1] * 2
-    return ma111 > ma350_x2, ma111, ma350_x2, (ma350_x2 - ma111) / ma111
-
-# --- 8. 繪圖 ---
-def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
+# --- 5. 繪圖 ---
+def plot_combo_chart(ticker, df_close, df_vol, trend_data, fund_flow):
     if ticker not in df_close.columns: return None
-    try:
-        lookback = 250
-        dates = df_close.index[-lookback:]
-        def get_s(df, t): return df[t].iloc[-len(dates):] if t in df.columns else pd.Series()
-        
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=dates, open=get_s(df_open, ticker), high=get_s(df_high, ticker), 
-                                     low=get_s(df_low, ticker), close=get_s(df_close, ticker), name='Price',
-                                     increasing_line_color='#00FF7F', decreasing_line_color='#FF4B4B'))
-        fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].ewm(span=20).mean().iloc[-len(dates):], 
-                                 mode='lines', name='20 EMA', line=dict(color='#FFD700', width=1.5)))
-        fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].rolling(200).mean().iloc[-len(dates):], 
-                                 mode='lines', name='200 SMA', line=dict(color='#00BFFF', width=2.0, dash='dash')))
-        fig.update_layout(title=f"{ticker} - Daily Chart", height=350, margin=dict(l=0, r=0, t=30, b=0),
-                          xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='white'))
-        return fig
-    except: return None
+    
+    dates = df_close.index[-150:]
+    closes = df_close[ticker].iloc[-150:]
+    obv = fund_flow['obv_series'].iloc[-150:]
+    
+    fig = go.Figure()
+    
+    # 主圖：K線
+    fig.add_trace(go.Scatter(x=dates, y=closes, name='Price', line=dict(color='#00FF7F', width=2)))
+    fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].ewm(span=20).mean().iloc[-150:], name='20 EMA', line=dict(color='#FFD700', width=1)))
+    
+    # 副圖：OBV
+    fig.add_trace(go.Scatter(x=dates, y=obv, name='OBV (資金)', line=dict(color='#00BFFF', width=2), yaxis='y2'))
+    
+    fig.update_layout(
+        title=f"{ticker} - 量價關係圖",
+        height=400,
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='white'),
+        xaxis=dict(showgrid=False),
+        yaxis=dict(title="Price", showgrid=True, gridcolor='#333'),
+        yaxis2=dict(title="OBV", overlaying='y', side='right', showgrid=False)
+    )
+    return fig
 
-# --- 9. 輸入解析 ---
 def parse_input(text):
     port = {}
     for line in text.strip().split('\n'):
@@ -198,12 +217,22 @@ def parse_input(text):
 
 # --- MAIN ---
 def main():
-    st.title("Alpha 2.0 Pro: 戰略資產中控台")
-    st.caption("v17.0 乖離警示版 | 新增乖離率偵測與紅字警告")
+    st.title("Alpha 2.0 Pro: 雙引擎資金雷達版")
+    st.caption("v19.0 | 自動載入 Secrets API Key")
     st.markdown("---")
 
     with st.sidebar:
-        st.header("⚙️ 資產配置輸入")
+        st.header("⚙️ 參數設定")
+        
+        # [升級] 自動從 Secrets 讀取 Key，若無則顯示輸入框
+        fred_key = None
+        if "FRED_API_KEY" in st.secrets:
+            fred_key = st.secrets["FRED_API_KEY"]
+            st.success("🔑 FRED API Key 已從 Secrets 載入")
+        else:
+            fred_key = st.text_input("FRED API Key (選填)", type="password", help="輸入後可解鎖真實流動性數據")
+        
+        st.header("💼 資產配置")
         default_input = """BTC-USD, 70000
 BNSOL-USD, 130000
 ETH-USD, 10000
@@ -216,109 +245,152 @@ URA, 35000"""
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
         st.metric("總資產估值 (Est.)", f"${total_value:,.0f}")
-        if st.button("🚀 啟動量化審計", type="primary"): st.session_state['run_analysis'] = True
         
-    if not st.session_state.get('run_analysis', False):
-        st.info("👈 請點擊『啟動量化審計』。")
+        if st.button("🚀 啟動全域掃描", type="primary"): st.session_state['run'] = True
+
+    if not st.session_state.get('run', False):
+        if fred_key:
+            st.info("👈 API Key 已就緒，請點擊『啟動全域掃描』。")
+        else:
+            st.info("👈 請輸入 FRED Key (可選) 並點擊啟動。")
         return
 
-    with st.spinner("Alpha 正在同步全市場數據..."):
-        df_close, df_open, df_high, df_low = fetch_data(tickers_list)
+    # 下載數據
+    with st.spinner("正在建立雙引擎連線 (FRED + Market)..."):
+        df_close, df_open, df_high, df_low, df_vol = fetch_market_data(tickers_list)
+        df_liquidity = fetch_fred_liquidity(fred_key)
         qqq_pe = get_valuation_metrics('QQQ')
-            
-    if df_close.empty:
-        st.error("數據獲取失敗。"); return
 
-    # --- A. 宏觀 ---
-    st.subheader("1. 宏觀戰情室")
-    qqq_trend = analyze_trend(df_close.get('QQQ'))
-    hyg_trend = analyze_trend(df_close.get('HYG'))
+    if df_close.empty: st.error("市場數據獲取失敗"); return
+
+    # --- A. 宏觀與流動性 (The Engine Room) ---
+    st.subheader("1. 宏觀與流動性引擎 (The Engine Room)")
+    
+    # 計算宏觀指標
     vix = df_close.get('^VIX').iloc[-1] if '^VIX' in df_close else None
-    gear, reason = determine_strategy_gear(qqq_trend, vix, qqq_pe, hyg_trend)
+    hyg_trend = analyze_trend(df_close.get('HYG'))
     
+    # 計算真實流動性狀態
+    liq_status = "未知 (無 Key)"
+    liq_trend_val = "N/A"
+    if df_liquidity is not None:
+        current_liq = df_liquidity['Net_Liquidity'].iloc[-1]
+        prev_liq = df_liquidity['Net_Liquidity'].iloc[-5] # 一週前
+        if current_liq > prev_liq: 
+            liq_status = "擴張 (印鈔中)"
+            liq_trend_val = "擴張"
+        else: 
+            liq_status = "收縮 (抽水中)"
+            liq_trend_val = "收縮"
+    
+    # 決策
+    qqq_trend = analyze_trend(df_close.get('QQQ'))
+    gear, reason = determine_strategy_gear(qqq_trend, vix, qqq_pe, hyg_trend, liq_trend_val)
+    
+    # 顯示儀表
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.metric("VIX", f"{vix:.2f}" if vix else "N/A", delta="高風險" if vix and vix>22 else "安全", delta_color="inverse")
+    with c1: 
+        if df_liquidity is not None:
+            st.metric("美元淨流動性 (Fed)", liq_status, f"${df_liquidity['Net_Liquidity'].iloc[-1]:.2f}T")
+        else:
+            st.metric("美元淨流動性", "N/A", "未偵測到 API Key")
+            
     with c2: 
-        hyg_s = "充裕" if hyg_trend and hyg_trend['p_now'] > hyg_trend['sma200'] else "枯竭"
-        st.metric("流動性 (HYG)", hyg_s, delta="風險高" if hyg_s=="枯竭" else "風險低", delta_color="inverse")
-    with c3: st.metric("QQQ P/E", f"{qqq_pe:.1f}" if qqq_pe else "N/A", delta="昂貴" if qqq_pe and qqq_pe>28 else "合理", delta_color="inverse")
-    with c4: st.metric("Alpha 指令", gear)
+        h_stat = "充裕" if hyg_trend and hyg_trend['p_now'] > hyg_trend['sma200'] else "枯竭"
+        st.metric("信用市場 (HYG)", h_stat, delta="垃圾債健康" if h_stat=="充裕" else "違約風險升", delta_color="inverse")
+    with c3:
+        st.metric("VIX 恐慌指數", f"{vix:.2f}" if vix else "N/A", delta="風暴" if vix and vix>22 else "平靜", delta_color="inverse")
+    with c4:
+        st.metric("Alpha 指令", gear)
+
+    if "收縮" in liq_status or "枯竭" in h_stat:
+        st.warning(f"⚠️ **流動性警報：** {reason}")
+    else:
+        st.success(f"✅ **系統狀態：** {reason}")
+
+    # 流動性圖表
+    if df_liquidity is not None:
+        fig_liq = px.line(df_liquidity, y='Net_Liquidity', title='聯準會淨流動性趨勢 (Net Liquidity = Fed Assets - TGA - RRP)')
+        st.plotly_chart(fig_liq, use_container_width=True)
+
+    st.markdown("---")
+
+    # --- B. 資金流向深度審計 (Fund Flow Radar) ---
+    st.subheader("2. 持倉資金流向雷達 (Fund Flow Radar)")
+    st.markdown("偵測「量價背離」與「主力吸籌」跡象：")
     
-    if "熊市" in gear or "枯竭" in gear: st.error(f"決策：{reason}")
-    else: st.success(f"決策：{reason}")
-    
+    for ticker in tickers_list:
+        if ticker not in df_close.columns: continue
+        trend = analyze_trend(df_close[ticker])
+        ff = calc_fund_flow(df_close[ticker], df_high[ticker], df_low[ticker], df_vol[ticker])
+        
+        if not trend or not ff: continue
+        
+        # 資金流訊號判斷
+        obv_signal = "吸籌 (量先價行)" if ff['obv_slope'] > 0 else "出貨 (量縮/背離)"
+        mfi_signal = "過熱 (>80)" if ff['mfi'] > 80 else ("超賣 (<20)" if ff['mfi'] < 20 else "中性")
+        
+        with st.expander(f"📡 {ticker} - 資金訊號: {obv_signal} | MFI: {ff['mfi']:.1f}", expanded=True):
+            k1, k2 = st.columns([3, 1])
+            with k1:
+                st.plotly_chart(plot_combo_chart(ticker, df_close, df_vol, trend, ff), use_container_width=True, key=f"ff_{ticker}")
+            with k2:
+                st.markdown("#### 資金數據")
+                st.metric("OBV 趨勢", "向上" if ff['obv_slope'] > 0 else "向下", delta=f"斜率: {ff['obv_slope']:.2f}")
+                st.metric("MFI 資金流", f"{ff['mfi']:.1f}", delta=mfi_signal, delta_color="inverse")
+                
+                # 乖離警示
+                if trend['is_overheated']:
+                    st.error("🔥 價格乖離過大！(可能利好出盡)")
+                elif ff['mfi'] > 80:
+                    st.warning("⚠️ 資金極度過熱")
+                else:
+                    st.info("✅ 資金結構健康")
+                
+                st.divider()
+                st.caption(f"1個月預測: ${trend['p_1m']:.2f}")
+
     st.markdown("---")
     
-    # --- B. 總表 (含乖離警示) ---
-    st.subheader("2. 資產整合總表")
+    # --- C. 資產總表 ---
+    st.subheader("3. 資產配置總表")
     table_data = []
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         trend = analyze_trend(df_close[ticker])
-        if not trend: continue
+        vol_levels, vol_status = calc_volatility_shells(df_close[ticker])
+        ff = calc_fund_flow(df_close[ticker], df_high[ticker], df_low[ticker], df_vol[ticker])
         
-        levels, vol_status = calc_volatility_shells(df_close[ticker])
-        kelly_pct, _ = calc_kelly_position(trend)
         current_val = portfolio_dict.get(ticker, 0)
         weight = (current_val / total_value) if total_value > 0 else 0
         
-        # [新增] 乖離過大判斷邏輯
+        # 綜合建議
         action = "持有"
-        # 1. 優先處理年線 (最大風險)
-        if trend['p_now'] < trend['sma200']: action = "熊市避險"
-        # 2. 處理乖離 (漲太快)
-        elif trend['is_overheated']: action = "⚠️ 乖離過大 (止盈)"
-        # 3. 處理波動
-        elif vol_status == "💎 超賣機會 (L2)": action = "加倉/抄底"
-        elif vol_status == "⚠️ 情緒過熱 (H2)": action = "止盈觀察"
-
+        if trend['is_overheated'] or (ff and ff['mfi']>85): action = "止盈 (過熱)"
+        elif trend['status'] == "🛑 熊市防禦": action = "清倉/避險"
+        elif ff and ff['obv_slope'] > 0 and vol_status == "💎 超賣機會 (L2)": action = "強力買進 (吸籌)"
+        
         table_data.append({
             "代號": ticker,
             "權重": f"{weight:.1%}",
             "現價": f"${trend['p_now']:.2f}",
             "趨勢": trend['status'],
-            "1個月預測": f"${trend['p_1m']:.2f}",
-            "乖離警示": "🔥 過熱" if trend['is_overheated'] else "正常", # 新增欄位
-            "六維狀態": vol_status,
+            "資金流 (OBV)": "流入 🟢" if ff and ff['obv_slope']>0 else "流出 🔴",
+            "MFI狀態": f"{ff['mfi']:.0f}" if ff else "N/A",
+            "乖離警示": "🔥" if trend['is_overheated'] else "-",
             "建議": action
         })
-    
-    c1, c2 = st.columns([2, 1])
-    with c1: st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-    with c2: 
-        fig = px.pie(pd.DataFrame(list(portfolio_dict.items()), columns=['Ticker', 'Value']), values='Value', names='Ticker', title='配置', hole=0.4)
-        fig.update_layout(margin=dict(t=30, b=0, l=0, r=0), height=300)
-        st.plotly_chart(fig, use_container_width=True, key="pie")
-
-    st.markdown("---")
-    
-    # --- C. 深度審計 ---
-    st.subheader("3. 深度審計 (含乖離分析)")
-    for ticker in tickers_list:
-        if ticker not in df_close.columns: continue
-        trend = analyze_trend(df_close[ticker])
-        if not trend: continue
         
-        with st.expander(f"📊 {ticker} - {trend['status']}", expanded=True):
-            c1, c2 = st.columns([3, 1])
-            with c1: 
-                fig = plot_kline_chart(ticker, df_close, df_open, df_high, df_low)
-                if fig: st.plotly_chart(fig, use_container_width=True, key=f"d_{ticker}")
-            with c2:
-                st.markdown("#### 關鍵數據")
-                # 乖離警示
-                if trend['is_overheated']:
-                    st.warning(f"⚠️ **乖離過大**\n\n現價 ({trend['p_now']:.2f}) 已遠高於趨勢預測線 ({trend['p_1m']:.2f})。短線有回調壓力，不宜追高。")
-                else:
-                    st.info("✅ 價格與趨勢同步，健康上漲。")
-                
-                delta_val = (trend['p_1m']-trend['p_now'])/trend['p_now']
-                st.metric("1個月目標", f"${trend['p_1m']:.2f}", delta=f"{delta_val:.1%}", 
-                          delta_color="normal" if delta_val > 0 else "inverse") # 負數會變紅字
+    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.header("4. 量化模型白皮書")
-    st.info("**乖離率 (Deviation) 說明：** 當「趨勢向上」但「預測價格 < 現價」時，代表股價短期漲幅過大，脫離了統計學上的回歸中樞。這通常是「短線過熱」的訊號，建議止盈或等待回調，而非追價。")
+    st.header("4. 量化模型白皮書 (v19.0)")
+    st.info("""
+    **新增模組說明：**
+    1. **淨流動性 (Net Liquidity):** 這是美股的「燃料」。公式 = Fed資產 - TGA帳戶 - 逆回購。水位上升=牛市引擎；水位下降=熊市壓力。
+    2. **OBV (能量潮):** 累計成交量指標。當股價盤整但 OBV 創新高，代表主力在「吸籌」，是暴漲前兆。
+    3. **MFI (資金流指標):** 結合價格與成交量的 RSI。MFI > 80 代表資金過熱，通常是利好出盡的賣點。
+    """)
 
 if __name__ == "__main__":
     main()
