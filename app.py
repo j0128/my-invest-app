@@ -7,7 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 2.0 Pro: 決策金字塔", layout="wide", page_icon="🏛️")
+st.set_page_config(page_title="Alpha 2.0 Pro: 戰略資產中控台", layout="wide", page_icon="🏛️")
 
 # 自定義 CSS
 st.markdown("""
@@ -16,18 +16,19 @@ st.markdown("""
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
-    .risk-box {background-color: #2D0000; padding: 10px; border-radius: 5px; border-left: 5px solid #FF4B4B;}
-    .safe-box {background-color: #002D00; padding: 10px; border-radius: 5px; border-left: 5px solid #00FF7F;}
+    .risk-box {border-left: 5px solid #FF4B4B; background-color: #2D0000; padding: 10px;}
+    .safe-box {border-left: 5px solid #00FF7F; background-color: #002D00; padding: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (OHLC + 宏觀數據) ---
+# --- 1. 核心數據引擎 (含流動性指標) ---
 @st.cache_data(ttl=3600)
 def fetch_data(tickers):
     """
-    下載個股、基準、以及宏觀指標 (VIX, TNX)
+    下載個股、基準、宏觀 (VIX, TNX) 以及 流動性指標 (HYG)
     """
-    benchmarks = ['QQQ', 'QLD', 'TQQQ', 'BTC-USD', '^VIX', '^TNX'] # 加入 VIX 和 債券殖利率
+    # 新增 HYG (高收益債) 作為流動性代理
+    benchmarks = ['QQQ', 'QLD', 'TQQQ', 'BTC-USD', '^VIX', '^TNX', 'HYG'] 
     all_tickers = list(set(tickers + benchmarks))
     
     dict_close = {}
@@ -35,7 +36,7 @@ def fetch_data(tickers):
     dict_high = {}
     dict_low = {}
     
-    progress_bar = st.progress(0, text="Alpha 正在建立宏觀數據連線...")
+    progress_bar = st.progress(0, text="Alpha 正在建立全市場連線...")
     
     for i, t in enumerate(all_tickers):
         try:
@@ -60,7 +61,7 @@ def fetch_data(tickers):
             pd.DataFrame(dict_low).ffill())
 
 # --- 2. 獲取基本面估值 (Layer 0) ---
-@st.cache_data(ttl=3600*12) # 估值不用常變，12小時更新一次
+@st.cache_data(ttl=3600*12)
 def get_valuation_metrics(ticker):
     try:
         info = yf.Ticker(ticker).info
@@ -73,12 +74,11 @@ def get_valuation_metrics(ticker):
 def analyze_trend(series):
     if series is None: return None
     series = series.dropna()
-    if series.empty or len(series) < 200: return None # 需要足夠數據算年線
+    if series.empty or len(series) < 200: return None
 
     y = series.values.reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
     
-    # 線性回歸
     model = LinearRegression().fit(x, y)
     k = model.coef_[0].item()
     r2 = model.score(x, y)
@@ -86,16 +86,14 @@ def analyze_trend(series):
     p_now = series.iloc[-1].item()
     p_1m = model.predict([[len(y) + 22]])[0].item()
     
-    # 指標計算
     ema20 = series.ewm(span=20).mean().iloc[-1].item()
-    sma200 = series.rolling(200).mean().iloc[-1].item() # 長期趨勢線 (牛熊分界)
+    sma200 = series.rolling(200).mean().iloc[-1].item()
     
-    # 狀態判定邏輯
     status = "🛡️ 區間盤整"
     color = "neutral"
     
     if p_now < sma200:
-        status = "🛑 熊市防禦 (破年線)" # Layer 2: Trend Filter
+        status = "🛑 熊市防禦 (破年線)"
         color = "bearish"
     elif p_now > ema20 and k > 0:
         status = "🔥 加速進攻"
@@ -133,9 +131,9 @@ def calc_volatility_shells(series):
         return {}, "計算錯誤"
 
 # --- 5. 戰略檔位決策引擎 (The Gearbox) ---
-def determine_strategy_gear(qqq_trend, vix_now, qqq_pe):
+def determine_strategy_gear(qqq_trend, vix_now, qqq_pe, hyg_trend):
     """
-    六層決策金字塔的核心邏輯
+    六層決策金字塔 (含流動性檢查)
     """
     if not qqq_trend: return "N/A", "數據不足"
     
@@ -143,33 +141,37 @@ def determine_strategy_gear(qqq_trend, vix_now, qqq_pe):
     sma200 = qqq_trend['sma200']
     ema20 = qqq_trend['ema20']
     
-    # 預設值處理
+    # 預設值
     vix = vix_now if vix_now else 20
-    pe = qqq_pe if qqq_pe else 25 # 如果抓不到 PE，預設為 25 (中性)
+    pe = qqq_pe if qqq_pe else 25 
     
-    # --- Layer 2: 長期趨勢濾網 ---
-    if price < sma200:
-        return "檔位 0 (現金/避險)", "🛑 熊市訊號：價格跌破 200日均線。多頭禁入，強制防禦。"
+    # 1. 流動性濾網 (Liquidity Filter) - 新增
+    # 如果高收益債 (HYG) 跌破年線，代表市場資金正在枯竭
+    if hyg_trend and hyg_trend['p_now'] < hyg_trend['sma200']:
+        return "檔位 0 (現金/避險)", "💧 流動性枯竭：高收益債 (HYG) 跌破年線。信用市場發出警訊，強制防禦。"
 
-    # --- Layer 0: 估值天花板 ---
-    if pe > 32: # 歷史極端高位
-        return "檔位 1 (QQQ)", "⚠️ 估值天花板：本益比過高 (>32)。禁止槓桿，僅持有現貨。"
+    # 2. 長期趨勢濾網 (Trend Filter)
+    if price < sma200:
+        return "檔位 0 (現金/避險)", "🛑 熊市訊號：QQQ 跌破 200日均線。多頭禁入。"
+
+    # 3. 估值天花板 (Valuation Ceiling)
+    if pe > 32:
+        return "檔位 1 (QQQ)", "⚠️ 估值天花板：本益比 > 32。禁止槓桿。"
     
-    # --- Layer 3: 宏觀風險儀表 (VIX) ---
+    # 4. 宏觀風險儀表 (VIX)
     if vix > 22:
         return "檔位 1 (QQQ)", "🌩️ 風暴警報：VIX > 22。市場恐慌，禁止槓桿。"
     
-    # --- Layer 0 (Part 2): 合理估值 ---
-    if pe > 28: # 稍微偏貴
-        # 允許 QLD (2x) 但禁止 TQQQ
+    # 5. 合理估值檢查
+    if pe > 28:
         if price > ema20:
-            return "檔位 2 (QLD)", "⚖️ 估值偏高：本益比 > 28。限制最大 2倍槓桿。"
+            return "檔位 2 (QLD)", "⚖️ 估值偏高：限制最大 2倍槓桿。"
         else:
             return "檔位 1 (QQQ)", "📉 動能不足：雖在牛市但短期轉弱。"
             
-    # --- Layer 4: 動能確認 (All Clear) ---
+    # 6. 動能確認 (All Clear)
     if price > ema20:
-        return "檔位 3 (TQQQ)", "🚀 完美風口：估值合理 + 趨勢向上 + 情緒穩定。允許 3倍槓桿。"
+        return "檔位 3 (TQQQ)", "🚀 完美風口：流動性充足 + 估值合理 + 趨勢向上。允許 3倍槓桿。"
     else:
         return "檔位 2 (QLD)", "🛡️ 趨勢回調：牛市中的回檔。保持 2倍槓桿或觀望。"
 
@@ -179,7 +181,7 @@ def calc_kelly_position(trend_data):
     win_rate = 0.55
     if trend_data['k'] > 0: win_rate += 0.05
     if trend_data['r2'] > 0.6: win_rate += 0.05
-    if "熊市" in trend_data['status']: win_rate -= 0.2 # 熊市勝率大減
+    if "熊市" in trend_data['status']: win_rate -= 0.2
     
     odds = 2.0 
     f_star = (odds * win_rate - (1 - win_rate)) / odds
@@ -199,7 +201,7 @@ def check_pi_cycle(btc_series):
 def plot_kline_chart(ticker, df_close, df_open, df_high, df_low, trend_data=None):
     if ticker not in df_close.columns: return None
     try:
-        lookback = 250 # 看一年，才能看到 200SMA
+        lookback = 250
         dates = df_close.index[-lookback:]
         
         def get_series(df, t):
@@ -214,28 +216,25 @@ def plot_kline_chart(ticker, df_close, df_open, df_high, df_low, trend_data=None
         if len(closes) == 0: return None
 
         fig = go.Figure()
-        # K 線
         fig.add_trace(go.Candlestick(
             x=dates, open=opens, high=highs, low=lows, close=closes,
             name='Price', increasing_line_color='#00FF7F', decreasing_line_color='#FF4B4B'
         ))
         
-        # 20EMA
         ema20 = df_close[ticker].ewm(span=20).mean().iloc[-len(dates):]
         fig.add_trace(go.Scatter(
-            x=dates, y=ema20, mode='lines', name='20 EMA (短期)',
+            x=dates, y=ema20, mode='lines', name='20 EMA',
             line=dict(color='#FFD700', width=1.5)
         ))
         
-        # 200SMA (年線) - 新增
         sma200 = df_close[ticker].rolling(200).mean().iloc[-len(dates):]
         fig.add_trace(go.Scatter(
-            x=dates, y=sma200, mode='lines', name='200 SMA (牛熊線)',
+            x=dates, y=sma200, mode='lines', name='200 SMA (年線)',
             line=dict(color='#00BFFF', width=2.0, dash='dash')
         ))
 
         fig.update_layout(
-            title=f"{ticker} - Daily Chart (含年線)", height=350, margin=dict(l=0, r=0, t=30, b=0),
+            title=f"{ticker} - Daily Chart", height=350, margin=dict(l=0, r=0, t=30, b=0),
             xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', 
             plot_bgcolor='rgba(0,0,0,0)', font=dict(color='white')
         )
@@ -262,7 +261,7 @@ def parse_input(input_text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 戰略資產中控台")
-    st.caption("v15.0 六層決策金字塔 | 防禦型 Alpha 核心")
+    st.caption("v16.0 決策金字塔 | 增強流動性監測 & 模型白皮書")
     st.markdown("---")
 
     # --- 側邊欄 ---
@@ -289,57 +288,62 @@ URA, 35000"""
         return
 
     # 下載數據
-    with st.spinner("Alpha 正在同步宏觀數據與股價..."):
+    with st.spinner("Alpha 正在同步宏觀數據與流動性指標..."):
         df_close, df_open, df_high, df_low = fetch_data(tickers_list)
-        # 嘗試獲取 QQQ 估值
         qqq_pe = get_valuation_metrics('QQQ')
             
     if df_close.empty:
         st.error("數據獲取失敗。")
         return
 
-    # --- A. 宏觀戰情室 (The War Room) ---
+    # --- A. 宏觀戰情室 ---
     st.subheader("1. 宏觀戰情室 (The War Room)")
     
-    # 準備數據
+    # 數據準備
     qqq_trend = analyze_trend(df_close.get('QQQ'))
+    hyg_trend = analyze_trend(df_close.get('HYG')) # 流動性指標
+    
     vix_series = df_close.get('^VIX')
     vix_now = vix_series.iloc[-1] if vix_series is not None and not vix_series.empty else None
+    
     tnx_series = df_close.get('^TNX')
     tnx_now = tnx_series.iloc[-1] if tnx_series is not None and not tnx_series.empty else None
     
-    # 決策引擎運算
-    gear, reason = determine_strategy_gear(qqq_trend, vix_now, qqq_pe)
+    # 決策引擎
+    gear, reason = determine_strategy_gear(qqq_trend, vix_now, qqq_pe, hyg_trend)
     
-    # 顯示儀表板
+    # 顯示儀表
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    
     with m_col1:
         st.metric("VIX 恐慌指數", f"{vix_now:.2f}" if vix_now else "N/A", 
-                 delta="高風險 > 20" if vix_now and vix_now > 20 else "安全", 
-                 delta_color="inverse")
+                 delta="高風險 > 20" if vix_now and vix_now > 20 else "安全", delta_color="inverse")
     with m_col2:
-        st.metric("10年期公債殖利率", f"{tnx_now:.2f}%" if tnx_now else "N/A")
+        # 流動性儀表：看 HYG 是否在年線之上
+        hyg_status = "充裕" if hyg_trend and hyg_trend['p_now'] > hyg_trend['sma200'] else "枯竭"
+        st.metric("市場流動性 (HYG)", hyg_status, 
+                 delta="信用風險低" if hyg_status=="充裕" else "信用風險高", delta_color="normal" if hyg_status=="充裕" else "inverse")
     with m_col3:
         pe_display = f"{qqq_pe:.1f}" if qqq_pe else "N/A (預設25)"
         st.metric("QQQ 遠期本益比", pe_display, 
-                 delta="昂貴 > 28" if qqq_pe and qqq_pe > 28 else "合理", 
-                 delta_color="inverse")
+                 delta="昂貴 > 28" if qqq_pe and qqq_pe > 28 else "合理", delta_color="inverse")
     with m_col4:
-        # 顯示 QQQ 200MA 狀態
         if qqq_trend:
             dist_sma = (qqq_trend['p_now'] - qqq_trend['sma200']) / qqq_trend['sma200']
             st.metric("QQQ vs 年線", f"{dist_sma:.1%}", "牛市區" if dist_sma>0 else "熊市區")
 
     # 顯示最終決策
-    st.info(f"### 🤖 Alpha 戰略指令：{gear}")
+    if "熊市" in gear or "流動性" in gear:
+        st.error(f"### 🛑 Alpha 防禦指令：{gear}")
+    else:
+        st.success(f"### 🚀 Alpha 進攻指令：{gear}")
     st.markdown(f"> **決策邏輯：** {reason}")
 
     st.markdown("---")
-    st.markdown("#### 🇺🇸 美國大盤基準 K 線 (含年線)")
+    st.markdown("#### 🇺🇸 關鍵基準 K 線 (大盤 vs 流動性)")
     
     b_col1, b_col2, b_col3 = st.columns(3)
-    benchmarks = ['QQQ', 'QLD', 'TQQQ']
+    # 加入 HYG 讓用戶直接看到流動性走勢
+    benchmarks = ['QQQ', 'TQQQ', 'HYG'] 
     for i, b_ticker in enumerate(benchmarks):
         with [b_col1, b_col2, b_col3][i]:
             if b_ticker in df_close.columns:
@@ -363,10 +367,9 @@ URA, 35000"""
         current_val = portfolio_dict.get(ticker, 0)
         weight = (current_val / total_value) if total_value > 0 else 0
         
-        # Action Logic (加入年線判斷)
+        # Action Logic
         action = "持有"
-        if trend['p_now'] < trend['sma200']: action = "熊市避險/清倉"
-        elif trend['status'] == "🛑 熊市防禦 (破年線)": action = "減倉/止損"
+        if trend['p_now'] < trend['sma200']: action = "熊市避險"
         elif vol_status == "💎 超賣機會 (L2)": action = "加倉/抄底"
         elif vol_status == "⚠️ 情緒過熱 (H2)": action = "止盈觀察"
 
@@ -375,7 +378,6 @@ URA, 35000"""
             "權重": f"{weight:.1%}",
             "現價": f"${trend['p_now']:.2f}",
             "趨勢狀態": trend['status'],
-            "1個月預測": f"${trend['p_1m']:.2f}",
             "年線乖離": f"{(trend['p_now']-trend['sma200'])/trend['sma200']:.1%}",
             "凱利建議": f"{kelly_pct:.1f}%",
             "六維狀態": vol_status,
@@ -396,50 +398,89 @@ URA, 35000"""
 
     # --- C. 持倉 K 線深度審計 ---
     st.subheader("3. 持倉 K 線深度審計 (Deep Dive)")
-    
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         trend = analyze_trend(df_close[ticker])
         if not trend: continue
         
-        with st.expander(f"📊 {ticker} - {trend['status']} (點擊展開 K 線圖)", expanded=True):
+        with st.expander(f"📊 {ticker} - {trend['status']}", expanded=True):
             k_col1, k_col2 = st.columns([3, 1])
-            
             with k_col1:
                 fig = plot_kline_chart(ticker, df_close, df_open, df_high, df_low)
                 if fig: st.plotly_chart(fig, use_container_width=True, key=f"deep_{ticker}")
-                
             with k_col2:
-                st.markdown("#### 六維數據")
+                st.markdown("#### 關鍵數據")
                 levels, vol_status = calc_volatility_shells(df_close[ticker])
-                st.caption(f"H2 (壓力): {levels.get('H2', 0):.2f}")
                 st.info(f"現價: {trend['p_now']:.2f}")
-                st.caption(f"L2 (支撐): {levels.get('L2', 0):.2f}")
                 
-                st.divider()
-                st.markdown("#### 趨勢濾網")
+                # 年線狀態
                 if trend['p_now'] > trend['sma200']:
-                    st.success("✅ 位於年線 (200SMA) 之上，長多格局。")
+                    st.success("✅ 年線之上 (長多)")
                 else:
-                    st.error("🛑 跌破年線 (200SMA)，進入熊市防禦區。")
+                    st.error("🛑 年線之下 (長空)")
+                
+                st.caption(f"支撐 (L2): {levels.get('L2', 0):.2f}")
+                st.divider()
+                st.metric("1個月目標", f"${trend['p_1m']:.2f}", delta=f"{(trend['p_1m']-trend['p_now'])/trend['p_now']:.1%}")
 
     st.markdown("---")
 
-    # --- D. 六層決策金字塔說明書 ---
-    st.header("4. 終極投資框架：六層決策金字塔 (The Decision Pyramid)")
-    st.markdown("""
-    本系統融合了「防禦型 Alpha」與「動態槓桿」哲學，旨在確保投資人在牛市賺取超額收益，並在熊市存活。
-    """)
+    # --- D. 量化模型白皮書 (Whitepaper) ---
+    st.header("4. 量化模型白皮書 (Quantitative Whitepaper)")
+    st.markdown("本系統融合「防禦型 Alpha」哲學，以下為各模組之質性與數學原理解析：")
 
     with st.container():
-        st.markdown("#### 🏰 第零層：估值天花板 (Valuation Ceiling)")
-        st.info("規則：當市場過於昂貴 (Forward P/E > 28) 時，禁止使用槓桿 (TQQQ)。這是避免「均值回歸」殺傷力的核心防線。")
+        st.markdown("#### 💧 1. 流動性監測模組 (Liquidity Monitor)")
+        st.info("""
+        **質性解釋：** 「信用利差」是市場的礦坑金絲雀。我們使用 **高收益債 (HYG)** 作為流動性代理。當資金寬鬆時，投資人願意買入垃圾債；當流動性枯竭時，垃圾債最先崩盤。
+        """)
+        st.latex(r'''
+        \text{Liquidity Crisis} = \text{Price}_{HYG} < \text{SMA}_{200}(HYG)
+        ''')
+        st.markdown("若 HYG 跌破年線，代表系統性風險極高，無論股市走勢如何，皆應強制降檔。")
+
+        st.divider()
+
+        st.markdown("#### 📐 2. 趨勢判定模型 (Trend Model)")
+        st.info("""
+        **質性解釋：** 採用雙重濾網：
+        1. **長期 (SMA200)：** 決定牛熊分界。年線之下不作多。
+        2. **短期 (EMA20 + Slope)：** 決定進攻時機。價格站上生命線且斜率向上，代表動能強勁。
+        """)
+        st.latex(r'''
+        \text{Status} = \begin{cases} 
+        \text{🛑 Bearish}, & \text{if } P < SMA_{200} \\
+        \text{🔥 Bullish}, & \text{if } P > EMA_{20} \text{ and } Slope > 0 \\
+        \text{🛡️ Neutral}, & \text{otherwise}
+        \end{cases}
+        ''')
+
+        st.divider()
+
+        st.markdown("#### 🏰 3. 估值天花板 (Valuation Ceiling)")
+        st.info("""
+        **質性解釋：** 樹不會長到天上去。當納斯達克 (QQQ) 的遠期本益比超過歷史極端值 (28x-32x) 時，即使趨勢向上，期望回報率也極低，且面臨巨大的「均值回歸」風險。此時禁止開槓桿。
+        """)
         
-        st.markdown("#### 🌊 第二層：長期趨勢濾網 (The Trend Filter)")
-        st.info("規則：200日均線 (SMA200) 是牛熊分界線。價格在年線之下 = 熊市，系統會強制建議「防禦/現金」，優先級高於所有短期指標。")
+        st.divider()
+
+        st.markdown("#### 🎲 4. 凱利公式倉位建議 (Kelly Criterion)")
+        st.info("""
+        **質性解釋：** 賭場與對沖基金的資金管理聖杯。根據勝率與盈虧比，計算數學上最優的下注比例。本系統在熊市狀態下會自動懲罰勝率 ($p - 20\%$)，以保護本金。
+        """)
+        st.latex(r'''
+        f^* = \frac{p(b+1)-1}{b} \times 0.5 \quad (\text{Half-Kelly})
+        ''')
         
-        st.markdown("#### 🌩️ 第三層：宏觀儀表 (Risk Dashboard)")
-        st.info("規則：監控 VIX 恐慌指數。當 VIX > 22 時，代表市場進入「風暴模式」，此時應降檔減速，而非冒險。")
+        st.divider()
+        
+        st.markdown("#### 🛡️ 5. 六維波動防禦 (Volatility Shells)")
+        st.info("""
+        **質性解釋：** 利用統計學標準差 ($\sigma$) 描繪價格運行的「道路邊界」。L2 (2倍標準差下緣) 通常是主力洗盤的極限，也是絕佳的左側抄底點。
+        """)
+        st.latex(r'''
+        \text{Band} = \mu_{20} \pm (n \times \sigma_{20}), \quad n \in \{1, 2, 3\}
+        ''')
 
 if __name__ == "__main__":
     main()
