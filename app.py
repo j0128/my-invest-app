@@ -87,7 +87,7 @@ def calc_fund_flow(close, high, low, volume):
         
     return {"obv_slope": obv_slope, "mfi": mfi, "obv_series": obv}
 
-# --- 3. 趨勢與估值 ---
+# --- 3. 趨勢與雙週期預測 (核心修改) ---
 def analyze_trend(series):
     if series is None: return None
     series = series.dropna()
@@ -98,9 +98,13 @@ def analyze_trend(series):
     model = LinearRegression().fit(x, y)
     
     p_now = series.iloc[-1].item()
-    p_1m = model.predict([[len(y) + 22]])[0].item()
+    
+    # [新增] 雙週期預測
+    p_2w = model.predict([[len(y) + 10]])[0].item() # 2週 = 10交易日
+    p_1m = model.predict([[len(y) + 22]])[0].item() # 1月 = 22交易日
+    
     k = model.coef_[0].item()
-    r2 = model.score(x, y) # 用於凱利公式
+    r2 = model.score(x, y)
     
     ema20 = series.ewm(span=20).mean().iloc[-1].item()
     sma200 = series.rolling(200).mean().iloc[-1].item()
@@ -112,7 +116,8 @@ def analyze_trend(series):
         
     is_overheated = (k > 0 and p_1m < p_now)
     
-    return {"k": k, "r2": r2, "p_now": p_now, "p_1m": p_1m, "ema20": ema20, "sma200": sma200, 
+    return {"k": k, "r2": r2, "p_now": p_now, "p_2w": p_2w, "p_1m": p_1m, # 回傳兩個預測值
+            "ema20": ema20, "sma200": sma200, 
             "status": status, "is_overheated": is_overheated}
 
 @st.cache_data(ttl=3600*12)
@@ -135,7 +140,7 @@ def calc_volatility_shells(series):
         return levels, status
     except: return {}, "計算錯誤"
 
-# --- 4. 凱利公式 (本次修復重點) ---
+# --- 4. 凱利公式 ---
 def calc_kelly_position(trend_data):
     if not trend_data: return 0, 0
     win_rate = 0.55
@@ -196,7 +201,7 @@ def parse_input(text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 雙引擎資金雷達版")
-    st.caption("v21.0 凱利回歸版 | 完整功能 + 公式白皮書")
+    st.caption("v22.0 雙週期預測版 | 2週與1月目標價並列")
     st.markdown("---")
 
     with st.sidebar:
@@ -302,11 +307,13 @@ URA, 35000"""
                 else: st.info("✅ 資金結構健康")
                 
                 st.divider()
-                st.caption(f"1個月預測: ${trend['p_1m']:.2f}")
+                # 顯示雙週期預測
+                st.caption(f"2週目標: ${trend['p_2w']:.2f}")
+                st.caption(f"1月目標: ${trend['p_1m']:.2f}")
 
     st.markdown("---")
     
-    # --- C. 資產總表 (修復：加入凱利建議) ---
+    # --- C. 資產總表 (含雙週期) ---
     st.subheader("3. 資產配置總表")
     table_data = []
     for ticker in tickers_list:
@@ -314,7 +321,7 @@ URA, 35000"""
         trend = analyze_trend(df_close[ticker])
         vol_levels, vol_status = calc_volatility_shells(df_close[ticker])
         ff = calc_fund_flow(df_close[ticker], df_high[ticker], df_low[ticker], df_vol[ticker])
-        kelly_pct, _ = calc_kelly_position(trend) # 計算凱利
+        kelly_pct, _ = calc_kelly_position(trend)
         
         current_val = portfolio_dict.get(ticker, 0)
         weight = (current_val / total_value) if total_value > 0 else 0
@@ -329,9 +336,9 @@ URA, 35000"""
             "權重": f"{weight:.1%}",
             "現價": f"${trend['p_now']:.2f}",
             "趨勢": trend['status'],
-            "資金流 (OBV)": "流入 🟢" if ff and ff['obv_slope']>0 else "流出 🔴",
-            "MFI狀態": f"{ff['mfi']:.0f}" if ff else "N/A",
-            "凱利建議": f"{kelly_pct:.1f}%", # 關鍵修復
+            "2週預測": f"${trend['p_2w']:.2f}", # 新增
+            "1月預測": f"${trend['p_1m']:.2f}",
+            "凱利建議": f"{kelly_pct:.1f}%",
             "乖離警示": "🔥" if trend['is_overheated'] else "-",
             "建議": action
         })
@@ -345,6 +352,16 @@ URA, 35000"""
     st.markdown("本系統融合「資金流向」、「宏觀流動性」與「技術結構」，以下為全模組之運作原理：")
 
     with st.container():
+        st.markdown("#### 🔮 0. 價格預測模型 (Linear Projection)")
+        st.info("""
+        **質性解釋：** 基於過去 2 年的價格走勢，畫出一條最適合的線性回歸趨勢線，並推演未來價格。
+        * **2週預測：** 趨勢線延伸 10 個交易日 ($t+10$)。
+        * **1月預測：** 趨勢線延伸 22 個交易日 ($t+22$)。
+        """)
+        st.latex(r'''P_{future} = \alpha + \beta(t + \Delta t), \quad \Delta t \in \{10, 22\}''')
+
+        st.divider()
+
         st.markdown("#### 💧 1. 聯準會淨流動性 (Fed Net Liquidity)")
         st.info("質性解釋：這是美股的「真實燃料」。公式 = Fed資產 - TGA - 逆回購。水位上升=牛市引擎；水位下降=熊市壓力。")
         st.latex(r'''\text{Net Liquidity} = \text{Fed Bal. Sheet} - \text{TGA} - \text{RRP}''')
