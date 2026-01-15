@@ -19,7 +19,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (OHLC 升級版 - 支援 K 線) ---
+# --- 1. 核心數據引擎 (OHLC 序列下載版) ---
 @st.cache_data(ttl=3600)
 def fetch_data(tickers):
     """
@@ -41,7 +41,7 @@ def fetch_data(tickers):
         try:
             progress_bar.progress((i + 1) / len(all_tickers), text=f"正在下載數據: {t} ...")
             
-            # 使用 Ticker.history 抓取 1 年數據 (畫圖最佳長度)
+            # 使用 Ticker.history 抓取 1 年數據
             df = yf.Ticker(t).history(period="1y", auto_adjust=True)
             
             if df.empty: continue
@@ -62,7 +62,7 @@ def fetch_data(tickers):
             pd.DataFrame(dict_high).ffill(), 
             pd.DataFrame(dict_low).ffill())
 
-# --- 2. 核心趨勢模組 (保持不變) ---
+# --- 2. 核心趨勢模組 ---
 def analyze_trend(series):
     if series is None: return None
     series = series.dropna()
@@ -78,7 +78,7 @@ def analyze_trend(series):
     
     # 價格預測
     p_now = series.iloc[-1]
-    p_1m = model.predict([[len(y) + 22]])[0].item() # 1個月後
+    p_1m = model.predict([[len(y) + 22]])[0].item()
     
     # 20EMA 狀態判定
     ema20 = series.ewm(span=20).mean().iloc[-1]
@@ -95,7 +95,7 @@ def analyze_trend(series):
         
     return {"k": k, "r2": r2, "p_now": p_now, "p_1m": p_1m, "ema20": ema20, "status": status, "color": color}
 
-# --- 3. 六維波動防禦 (保持不變) ---
+# --- 3. 六維波動防禦 ---
 def calc_volatility_shells(series):
     window = 20
     rolling_mean = series.rolling(window).mean().iloc[-1]
@@ -114,7 +114,7 @@ def calc_volatility_shells(series):
     
     return levels, pos_desc
 
-# --- 4. 凱利公式 (保持不變) ---
+# --- 4. 凱利公式 ---
 def calc_kelly_position(trend_data):
     if not trend_data: return 0, 0
 
@@ -130,7 +130,7 @@ def calc_kelly_position(trend_data):
     
     return safe_kelly * 100, win_rate
 
-# --- 5. 比特幣逃頂 (保持不變) ---
+# --- 5. 比特幣逃頂 ---
 def check_pi_cycle(btc_series):
     if btc_series.empty: return False, 0, 0, 0
     
@@ -142,14 +142,13 @@ def check_pi_cycle(btc_series):
     
     return signal, ma111, ma350_x2, dist
 
-# --- 6. 繪圖模組 (新增：K 線圖) ---
+# --- 6. 繪圖模組 ---
 def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
     if ticker not in df_close.columns: return None
     try:
         lookback = 120 # 顯示過去半年
         dates = df_close.index[-lookback:]
         
-        # 安全取值
         def get_series(df, t):
             if t in df.columns: return df[t].iloc[-len(dates):]
             return pd.Series()
@@ -162,12 +161,10 @@ def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
         if len(closes) == 0: return None
 
         fig = go.Figure()
-        # K 線
         fig.add_trace(go.Candlestick(
             x=dates, open=opens, high=highs, low=lows, close=closes,
             name='Price', increasing_line_color='#00FF7F', decreasing_line_color='#FF4B4B'
         ))
-        # 20EMA
         ema20 = df_close[ticker].ewm(span=20).mean().iloc[-len(dates):]
         fig.add_trace(go.Scatter(
             x=dates, y=ema20, mode='lines', name='20 EMA',
@@ -183,7 +180,7 @@ def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
     except:
         return None
 
-# --- 7. 輸入解析 (保持不變) ---
+# --- 7. 輸入解析 ---
 def parse_input(input_text):
     portfolio = {}
     lines = input_text.strip().split('\n')
@@ -202,6 +199,7 @@ def parse_input(input_text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 戰略資產中控台")
+    st.caption("v13.0 防撞版 | 修復 Duplicate Element ID 錯誤")
     st.markdown("---")
 
     # --- 側邊欄 ---
@@ -226,7 +224,7 @@ NVDA, 10000"""
         st.info("👈 請在左側輸入您的持倉，並點擊『啟動量化審計』。")
         return
 
-    # 下載數據 (回傳 4 個 DF)
+    # 下載數據
     with st.spinner("Alpha 正在下載 K 線數據..."):
         df_close, df_open, df_high, df_low = fetch_data(tickers_list)
             
@@ -267,16 +265,19 @@ NVDA, 10000"""
             if ret_tq/ret_q < 2.5: st.warning("⚠️ 槓桿損耗過大")
             else: st.success("⚡ 槓桿效率優良")
 
-    # [新增] 宏觀基準 K 線
     st.markdown("---")
     st.markdown("#### 🇺🇸 美國大盤基準 K 線")
+    
+    # [關鍵修復]：加入 unique key 防止 ID 衝突
     b_col1, b_col2, b_col3 = st.columns(3)
     benchmarks = ['QQQ', 'QLD', 'TQQQ']
     for i, b_ticker in enumerate(benchmarks):
         with [b_col1, b_col2, b_col3][i]:
             if b_ticker in df_close.columns:
                 fig = plot_kline_chart(b_ticker, df_close, df_open, df_high, df_low)
-                if fig: st.plotly_chart(fig, use_container_width=True)
+                if fig: 
+                    # 這裡加上了 key=f"bench_{b_ticker}"，這是修復的關鍵！
+                    st.plotly_chart(fig, use_container_width=True, key=f"bench_{b_ticker}")
 
     st.markdown("---")
 
@@ -320,30 +321,29 @@ NVDA, 10000"""
             pie_df = pd.DataFrame(list(portfolio_dict.items()), columns=['Ticker', 'Value'])
             fig = px.pie(pie_df, values='Value', names='Ticker', title='資產配置', hole=0.4)
             fig.update_layout(margin=dict(t=30, b=0, l=0, r=0), height=300)
-            st.plotly_chart(fig, use_container_width=True)
+            # 這裡也加個 key 保險
+            st.plotly_chart(fig, use_container_width=True, key="portfolio_pie")
 
     st.markdown("---")
 
-    # --- C. 持倉 K 線深度審計 (修正：加入 K 線) ---
+    # --- C. 持倉 K 線深度審計 ---
     st.subheader("3. 持倉 K 線深度審計 (Deep Dive)")
     
-    # 這裡改用 Expander，因為只有這樣才能把 K 線圖放得足夠大且清晰
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         trend = analyze_trend(df_close[ticker])
         if not trend: continue
         
-        # 標題直接顯示狀態，不用點開也能看
         with st.expander(f"📊 {ticker} - {trend['status']} (點擊展開 K 線圖)", expanded=True):
             k_col1, k_col2 = st.columns([3, 1])
             
             with k_col1:
-                # [新增] K 線圖
                 fig = plot_kline_chart(ticker, df_close, df_open, df_high, df_low)
-                if fig: st.plotly_chart(fig, use_container_width=True)
+                if fig: 
+                    # [關鍵修復]：這裡加上 key=f"deep_{ticker}"，防止跟上面的圖撞車！
+                    st.plotly_chart(fig, use_container_width=True, key=f"deep_{ticker}")
                 
             with k_col2:
-                # 保留原本的六維數據顯示
                 st.markdown("#### 六維數據")
                 levels, vol_status = calc_volatility_shells(df_close[ticker])
                 st.caption(f"H2 (壓力): {levels.get('H2', 0):.2f}")
