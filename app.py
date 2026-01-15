@@ -188,3 +188,58 @@ def run_strategic_audit_v5(data_dict, earnings_date_str, macro_data=None):
 # 假設 p 是包含 QQQ, QLD, TQQQ, BTC, AMD 的數據字典
 # audit_report = run_strategic_audit_v5(p, "2026-01-28")
 
+# --- 以下程式碼貼在 app.py 的最末端 ---
+
+st.title("🚀 Alpha 2.0 進攻型深度審計 (2026 版)")
+st.sidebar.info(f"當前系統時間: 2026-01-15 | 撤退目標: 2026-05-31")
+
+# 1. 模擬數據入口 (這裡應對接你的價格資料源)
+# 假設 p 是你之前從 API 抓取的包含 QQQ, QLD, TQQQ, BTC, AMD 的字典
+if 'p' in locals() or 'p' in globals():
+    try:
+        # 執行整合審計
+        # 這裡設定 AMD 的財報日為範例，請根據實際情況修改
+        results = run_strategic_audit_v5(p, earnings_date_str="2026-01-28")
+
+        if isinstance(results, dict):
+            # --- 第一排：核心進攻指標 (k, eff, p1) ---
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("進攻斜率 (k)", f"{results['K_Slope']:.2f}", delta=results['Trend_Status'])
+            with col2:
+                st.metric("趨勢純度 (eff)", f"{results['EFF_R2']:.2%}")
+            with col3:
+                st.metric("1M 目標價 (p1)", f"${results['P1_Target']:.2f}")
+            with col4:
+                st.metric("撤退倒數權重", f"{results['May_Exit_Countdown']:.2%}")
+
+            # --- 第二排：風險預警 (Earnings & Pi Cycle) ---
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.write(f"📅 財報風險: {results['Earnings_Risk']}")
+            with c2:
+                st.write(f"₿ BTC 頂部訊號 (Pi Cycle): {'⚠️ 警告' if results['Pi_Cycle_Top'] else '✅ 安全'}")
+            with c3:
+                st.write(f"📊 選股等級: **{results['Alpha_Grade']}**")
+
+            # --- 第三排：20EMA 趨勢與波段殼層視覺化 ---
+            st.subheader("🔥 趨勢生命線審計 (20EMA & Volatility Shells)")
+            # 建立微型圖表 (Sparklines 邏輯)
+            chart_data = pd.DataFrame({
+                "實際價格": p['QQQ'][-60:],  # 取最近 60 天
+                "預測趨勢": results['TS_Prediction'][-60:]
+            })
+            st.line_chart(chart_data)
+            
+            # 顯示殼層點位
+            st.write(f"**波動殼層預測 (1M):** 支撐 L1: ${results['Shells']['l1']:.2f} | 壓力 H1: ${results['Shells']['h1']:.2f}")
+
+        else:
+            st.error(results)
+
+    except Exception as e:
+        st.warning(f"等待數據流輸入中... {str(e)}")
+else:
+    st.warning("請確保數據字典 'p' 已正確讀取，系統才能啟動量化審計。")
+
