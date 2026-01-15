@@ -7,7 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 2.0: 戰略資產中控台", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Alpha 2.0 Pro: 戰略資產中控台", layout="wide", page_icon="📈")
 
 # 自定義 CSS 美化
 st.markdown("""
@@ -19,49 +19,80 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (Data Engine) ---
+# --- 1. 核心數據引擎 (Data Engine - 防彈版) ---
 @st.cache_data(ttl=3600)
 def fetch_data(tickers):
+    """
+    下載數據並強制標準化格式：
+    回傳的 df_close 等一定是 DataFrame，且 Columns 為 Ticker 名稱。
+    """
     benchmarks = ['QQQ', 'QLD', 'TQQQ', 'BTC-USD']
     all_tickers = list(set(tickers + benchmarks))
     
     try:
-        # 下載過去 1 年數據
-        data = yf.download(all_tickers, period="1y", auto_adjust=True)
+        # 下載過去 1 年數據，強制 progress=False 避免輸出干擾
+        data = yf.download(all_tickers, period="1y", auto_adjust=True, progress=False)
         
-        # 處理 MultiIndex
-        if isinstance(data.columns, pd.MultiIndex):
-            try:
-                df_close = data['Close']
-                df_open = data['Open']
-                df_high = data['High']
-                df_low = data['Low']
-                return df_close, df_open, df_high, df_low
-            except:
-                return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        if data.empty:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        # [關鍵修復] 處理 yfinance 不同版本的 MultiIndex 結構
+        # 目標：提取出 Price 層級，並確保 Columns 是 Ticker
+        def extract_price_type(data, price_col_name):
+            # 情況 A: MultiIndex (Price, Ticker) -> 標準情況
+            if isinstance(data.columns, pd.MultiIndex):
+                try:
+                    # 嘗試提取指定價格層級 (Close/Open...)
+                    return data.xs(price_col_name, axis=1, level=0)
+                except KeyError:
+                    # 某些版本 yfinance 如果只有一個 ticker 但仍是 MultiIndex
+                    return data[price_col_name]
+            # 情況 B: Single Index (Date, Open, Close...) -> 單一 Ticker
+            else:
+                # 為了統一格式，我們必須把它轉成以 Ticker 為 Column 的 DataFrame
+                # 如果只有一個 Ticker，all_tickers[0] 就是它
+                single_df = data[[price_col_name]].copy()
+                single_df.columns = all_tickers # 強制命名為 Ticker
+                return single_df
+
+        # 根據 auto_adjust=True，yfinance 通常回傳 'Close' (其實是 Adj Close)
+        # 若有 'Adj Close' 則優先使用，否則用 'Close'
+        close_col = 'Adj Close' if 'Adj Close' in data.columns.levels[0] else 'Close' if isinstance(data.columns, pd.MultiIndex) else 'Close'
         
-        # 舊版兼容
-        return data['Close'], data['Open'], data['High'], data['Low']
+        df_close = extract_price_type(data, close_col)
+        df_open  = extract_price_type(data, 'Open')
+        df_high  = extract_price_type(data, 'High')
+        df_low   = extract_price_type(data, 'Low')
+
+        # 資料補全，避免 NaN 造成計算崩潰
+        return df_close.ffill(), df_open.ffill(), df_high.ffill(), df_low.ffill()
+
     except Exception as e:
-        st.error(f"數據下載失敗: {e}")
+        st.error(f"數據下載發生嚴重錯誤: {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- 2. 核心趨勢模組 (Trend Projection) ---
+# --- 2. 核心趨勢模組 (Trend Projection - 純標量版) ---
 def analyze_trend(series):
-    if series.isnull().all(): return None
+    # 確保輸入是乾淨的 Series
+    series = series.dropna()
+    if series.empty: return None
 
     y = series.values.reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
     
     model = LinearRegression().fit(x, y)
-    k = model.coef_[0].item()
-    r2 = model.score(x, y)
     
-    p_now = series.iloc[-1]
+    # [關鍵修復] 使用 .item() 強制轉為 Python 原生 float
+    k = model.coef_[0].item()
+    r2 = model.score(x, y).item()
+    
+    # 提取數值 (Scalar)
+    p_now = series.iloc[-1].item()
     p_1m = model.predict([[len(y) + 22]])[0].item()
     
-    ema20 = series.ewm(span=20).mean().iloc[-1]
+    ema20 = series.ewm(span=20).mean().iloc[-1].item()
     
+    # 純標量比較，絕不會報錯
     if p_now > ema20 and k > 0:
         status = "🔥 加速進攻"
         color = "bullish"
@@ -74,12 +105,16 @@ def analyze_trend(series):
         
     return {"k": k, "r2": r2, "p_now": p_now, "p_1m": p_1m, "ema20": ema20, "status": status, "color": color}
 
-# --- 3. 六維波動防禦 (Volatility Shells) ---
+# --- 3. 六維波動防禦 (Volatility Shells - 純標量版) ---
 def calc_volatility_shells(series):
+    series = series.dropna()
+    if series.empty: return {}, "無數據"
+    
     window = 20
-    rolling_mean = series.rolling(window).mean().iloc[-1]
-    rolling_std = series.rolling(window).std().iloc[-1]
-    curr_price = series.iloc[-1]
+    # [關鍵修復] .item()
+    rolling_mean = series.rolling(window).mean().iloc[-1].item()
+    rolling_std = series.rolling(window).std().iloc[-1].item()
+    curr_price = series.iloc[-1].item()
     
     levels = {}
     for i in range(1, 4):
@@ -109,12 +144,16 @@ def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
     if ticker not in df_close.columns: return None
     
     lookback = 120
-    dates = df_close.index[-lookback:]
-    opens = df_open[ticker].iloc[-lookback:]
-    highs = df_high[ticker].iloc[-lookback:]
-    lows = df_low[ticker].iloc[-lookback:]
-    closes = df_close[ticker].iloc[-lookback:]
-    ema20 = df_close[ticker].ewm(span=20).mean().iloc[-lookback:]
+    # 確保只取該 Ticker 的數據
+    try:
+        dates = df_close.index[-lookback:]
+        opens = df_open[ticker].iloc[-lookback:]
+        highs = df_high[ticker].iloc[-lookback:]
+        lows = df_low[ticker].iloc[-lookback:]
+        closes = df_close[ticker].iloc[-lookback:]
+        ema20 = df_close[ticker].ewm(span=20).mean().iloc[-lookback:]
+    except KeyError:
+        return None
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
@@ -141,7 +180,12 @@ def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
 # --- 6. 績效對比圖 (ROI) ---
 def plot_comparison(tickers, df_close):
     lookback = 120 
-    df_slice = df_close[tickers].iloc[-lookback:].copy()
+    # 只取存在的 Columns
+    valid_tickers = [t for t in tickers if t in df_close.columns]
+    if not valid_tickers: return None
+    
+    df_slice = df_close[valid_tickers].iloc[-lookback:].copy()
+    # 正規化
     df_norm = (df_slice / df_slice.iloc[0]) - 1
     
     fig = px.line(df_norm, x=df_norm.index, y=df_norm.columns, 
@@ -178,6 +222,7 @@ def parse_input(input_text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 戰略資產中控台")
+    st.caption("v8.0 終極修復版 | 全標量運算核心")
     st.markdown("---")
 
     # 側邊欄
@@ -186,8 +231,7 @@ def main():
         st.caption("格式：代號, 持倉金額")
         default_input = """BTC-USD, 50000
 QQQ, 30000
-BNSOL-USD, 15000
-0050.TW, 20000
+AMD, 15000
 NVDA, 10000"""
         user_input = st.text_area("持倉清單", default_input, height=200)
         portfolio_dict = parse_input(user_input)
@@ -206,16 +250,17 @@ NVDA, 10000"""
         df_close, df_open, df_high, df_low = fetch_data(tickers_list)
             
     if df_close.empty:
-        st.error("無法獲取數據，請檢查代號。")
+        st.error("無法獲取數據，請檢查輸入的代號是否正確，或網路連線是否正常。")
         return
 
     # --- A. 績效對比實驗室 ---
     st.subheader("1. 績效對比實驗室 (Benchmark Lab)")
     compare_list = ['QQQ', 'QLD', 'TQQQ'] + tickers_list[:3]
     compare_list = list(set(compare_list))
-    valid_compare = [t for t in compare_list if t in df_close.columns]
     
-    st.plotly_chart(plot_comparison(valid_compare, df_close), use_container_width=True)
+    comp_fig = plot_comparison(compare_list, df_close)
+    if comp_fig:
+        st.plotly_chart(comp_fig, use_container_width=True)
     
     # 基準 K 線圖
     st.markdown("#### 🇺🇸 美國大盤基準 (Market Context)")
@@ -227,9 +272,10 @@ NVDA, 10000"""
         with col:
             if b_ticker in df_close.columns:
                 trend = analyze_trend(df_close[b_ticker])
-                st.markdown(f"**{b_ticker}** <span style='font-size:0.8em' class='{trend['color']}'>({trend['status']})</span>", unsafe_allow_html=True)
-                fig = plot_kline_chart(b_ticker, df_close, df_open, df_high, df_low)
-                st.plotly_chart(fig, use_container_width=True)
+                if trend:
+                    st.markdown(f"**{b_ticker}** <span style='font-size:0.8em' class='{trend['color']}'>({trend['status']})</span>", unsafe_allow_html=True)
+                    fig = plot_kline_chart(b_ticker, df_close, df_open, df_high, df_low)
+                    if fig: st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
 
@@ -239,6 +285,8 @@ NVDA, 10000"""
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         trend = analyze_trend(df_close[ticker])
+        if not trend: continue # 跳過無數據的
+        
         levels, vol_status = calc_volatility_shells(df_close[ticker])
         kelly_pct, win_prob = calc_kelly_position(trend)
         current_val = portfolio_dict.get(ticker, 0)
@@ -262,7 +310,11 @@ NVDA, 10000"""
     
     t_col1, t_col2 = st.columns([2, 1])
     with t_col1:
-        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+        if table_data:
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+        else:
+            st.warning("無有效資產數據可顯示")
+            
     with t_col2:
         if total_value > 0:
             pie_df = pd.DataFrame(list(portfolio_dict.items()), columns=['Ticker', 'Value'])
@@ -277,18 +329,19 @@ NVDA, 10000"""
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         trend = analyze_trend(df_close[ticker])
+        if not trend: continue
         
         with st.expander(f"📊 {ticker} - {trend['status']}", expanded=True):
             k_col1, k_col2 = st.columns([3, 1])
             with k_col1:
                 fig = plot_kline_chart(ticker, df_close, df_open, df_high, df_low)
-                st.plotly_chart(fig, use_container_width=True)
+                if fig: st.plotly_chart(fig, use_container_width=True)
             with k_col2:
                 st.markdown("#### 六維數據")
                 levels, vol_status = calc_volatility_shells(df_close[ticker])
-                st.caption(f"H2 (壓力): {levels['H2']:.2f}")
+                st.caption(f"H2 (壓力): {levels.get('H2', 0):.2f}")
                 st.info(f"現價: {trend['p_now']:.2f}")
-                st.caption(f"L2 (支撐): {levels['L2']:.2f}")
+                st.caption(f"L2 (支撐): {levels.get('L2', 0):.2f}")
                 st.divider()
                 st.markdown("#### Alpha 預測")
                 st.metric("1個月目標", f"${trend['p_1m']:.2f}", delta=f"{(trend['p_1m']-trend['p_now'])/trend['p_now']:.1%}")
