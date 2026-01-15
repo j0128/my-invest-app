@@ -18,7 +18,7 @@ st.markdown("""
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
-    .liquidity-box {border-left: 5px solid #00BFFF; background-color: #001f3f; padding: 10px;}
+    .formula-box {background-color: #1E1E1E; padding: 15px; border-radius: 10px; border-left: 5px solid #FFD700;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -218,13 +218,13 @@ def parse_input(text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 雙引擎資金雷達版")
-    st.caption("v19.0 | 自動載入 Secrets API Key")
+    st.caption("v20.0 最終白皮書版 | 完整量化邏輯揭露")
     st.markdown("---")
 
     with st.sidebar:
         st.header("⚙️ 參數設定")
         
-        # [升級] 自動從 Secrets 讀取 Key，若無則顯示輸入框
+        # 自動從 Secrets 讀取 Key
         fred_key = None
         if "FRED_API_KEY" in st.secrets:
             fred_key = st.secrets["FRED_API_KEY"]
@@ -263,19 +263,17 @@ URA, 35000"""
 
     if df_close.empty: st.error("市場數據獲取失敗"); return
 
-    # --- A. 宏觀與流動性 (The Engine Room) ---
+    # --- A. 宏觀與流動性 ---
     st.subheader("1. 宏觀與流動性引擎 (The Engine Room)")
     
-    # 計算宏觀指標
     vix = df_close.get('^VIX').iloc[-1] if '^VIX' in df_close else None
     hyg_trend = analyze_trend(df_close.get('HYG'))
     
-    # 計算真實流動性狀態
     liq_status = "未知 (無 Key)"
     liq_trend_val = "N/A"
     if df_liquidity is not None:
         current_liq = df_liquidity['Net_Liquidity'].iloc[-1]
-        prev_liq = df_liquidity['Net_Liquidity'].iloc[-5] # 一週前
+        prev_liq = df_liquidity['Net_Liquidity'].iloc[-5] 
         if current_liq > prev_liq: 
             liq_status = "擴張 (印鈔中)"
             liq_trend_val = "擴張"
@@ -283,11 +281,9 @@ URA, 35000"""
             liq_status = "收縮 (抽水中)"
             liq_trend_val = "收縮"
     
-    # 決策
     qqq_trend = analyze_trend(df_close.get('QQQ'))
     gear, reason = determine_strategy_gear(qqq_trend, vix, qqq_pe, hyg_trend, liq_trend_val)
     
-    # 顯示儀表
     c1, c2, c3, c4 = st.columns(4)
     with c1: 
         if df_liquidity is not None:
@@ -308,16 +304,14 @@ URA, 35000"""
     else:
         st.success(f"✅ **系統狀態：** {reason}")
 
-    # 流動性圖表
     if df_liquidity is not None:
-        fig_liq = px.line(df_liquidity, y='Net_Liquidity', title='聯準會淨流動性趨勢 (Net Liquidity = Fed Assets - TGA - RRP)')
+        fig_liq = px.line(df_liquidity, y='Net_Liquidity', title='聯準會淨流動性趨勢 (單位: 兆美元)')
         st.plotly_chart(fig_liq, use_container_width=True)
 
     st.markdown("---")
 
-    # --- B. 資金流向深度審計 (Fund Flow Radar) ---
+    # --- B. 資金流向雷達 ---
     st.subheader("2. 持倉資金流向雷達 (Fund Flow Radar)")
-    st.markdown("偵測「量價背離」與「主力吸籌」跡象：")
     
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
@@ -326,7 +320,6 @@ URA, 35000"""
         
         if not trend or not ff: continue
         
-        # 資金流訊號判斷
         obv_signal = "吸籌 (量先價行)" if ff['obv_slope'] > 0 else "出貨 (量縮/背離)"
         mfi_signal = "過熱 (>80)" if ff['mfi'] > 80 else ("超賣 (<20)" if ff['mfi'] < 20 else "中性")
         
@@ -339,13 +332,9 @@ URA, 35000"""
                 st.metric("OBV 趨勢", "向上" if ff['obv_slope'] > 0 else "向下", delta=f"斜率: {ff['obv_slope']:.2f}")
                 st.metric("MFI 資金流", f"{ff['mfi']:.1f}", delta=mfi_signal, delta_color="inverse")
                 
-                # 乖離警示
-                if trend['is_overheated']:
-                    st.error("🔥 價格乖離過大！(可能利好出盡)")
-                elif ff['mfi'] > 80:
-                    st.warning("⚠️ 資金極度過熱")
-                else:
-                    st.info("✅ 資金結構健康")
+                if trend['is_overheated']: st.error("🔥 價格乖離過大")
+                elif ff['mfi'] > 80: st.warning("⚠️ 資金極度過熱")
+                else: st.info("✅ 資金結構健康")
                 
                 st.divider()
                 st.caption(f"1個月預測: ${trend['p_1m']:.2f}")
@@ -364,7 +353,6 @@ URA, 35000"""
         current_val = portfolio_dict.get(ticker, 0)
         weight = (current_val / total_value) if total_value > 0 else 0
         
-        # 綜合建議
         action = "持有"
         if trend['is_overheated'] or (ff and ff['mfi']>85): action = "止盈 (過熱)"
         elif trend['status'] == "🛑 熊市防禦": action = "清倉/避險"
@@ -384,13 +372,69 @@ URA, 35000"""
     st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.header("4. 量化模型白皮書 (v19.0)")
-    st.info("""
-    **新增模組說明：**
-    1. **淨流動性 (Net Liquidity):** 這是美股的「燃料」。公式 = Fed資產 - TGA帳戶 - 逆回購。水位上升=牛市引擎；水位下降=熊市壓力。
-    2. **OBV (能量潮):** 累計成交量指標。當股價盤整但 OBV 創新高，代表主力在「吸籌」，是暴漲前兆。
-    3. **MFI (資金流指標):** 結合價格與成交量的 RSI。MFI > 80 代表資金過熱，通常是利好出盡的賣點。
-    """)
+
+    # --- D. 量化模型白皮書 (Comprehensive Whitepaper) ---
+    st.header("4. 量化模型白皮書 (Quantitative Logic & Formulas)")
+    st.markdown("本系統融合了「資金流向」、「宏觀流動性」與「技術結構」，以下為全模組之運作原理解析：")
+
+    with st.container():
+        # 1. 聯準會流動性
+        st.markdown("#### 💧 1. 聯準會淨流動性 (Fed Net Liquidity)")
+        st.info("""
+        **質性解釋：** 這是美股市場的「真實燃料」。當聯準會印鈔（資產增加）或逆回購釋放資金時，市場水位上升，有利於風險資產（如科技股、比特幣）。反之則為抽水。
+        """)
+        st.latex(r'''
+        \text{Net Liquidity} = \text{Fed Balance Sheet (WALCL)} - \text{Treasury Account (TGA)} - \text{Reverse Repo (RRP)}
+        ''')
+
+        st.divider()
+
+        # 2. 資金流向
+        st.markdown("#### 📡 2. 資金流向雷達 (Fund Flow Radar)")
+        st.info("""
+        **OBV (能量潮)：** 累積成交量的變化。若「價格盤整」但「OBV 創新高」，代表主力正在偷偷吸籌（Smart Money In）。
+        **MFI (資金流指標)：** 結合價格與量的 RSI。當 MFI > 80 代表資金過熱，容易出現利好出盡的回調。
+        """)
+
+        st.divider()
+
+        # 3. 趨勢判定
+        st.markdown("#### 📐 3. 趨勢雙重濾網 (Trend Filter)")
+        st.info("""
+        **長期 (SMA200)：** 牛熊分界線。價格在年線之下，代表長期趨勢轉空，系統強制建議防禦。
+        **短期 (EMA20 + 斜率)：** 進攻訊號。價格站上月線且斜率向上，代表短期動能強勁。
+        """)
+        st.latex(r'''
+        \text{Status} = \begin{cases} 
+        \text{🛑 Bearish}, & \text{if } P < SMA_{200} \\
+        \text{🔥 Bullish}, & \text{if } P > EMA_{20} \text{ and } Slope > 0 \\
+        \text{🛡️ Neutral}, & \text{otherwise}
+        \end{cases}
+        ''')
+
+        st.divider()
+
+        # 4. 估值天花板
+        st.markdown("#### 🏰 4. 估值天花板 (Valuation Ceiling)")
+        st.info("**質性解釋：** 當 QQQ 的遠期本益比 (Forward P/E) 超過 32 倍時，代表市場極度昂貴，預期回報率低，禁止使用槓桿。")
+
+        st.divider()
+
+        # 5. 凱利公式
+        st.markdown("#### 🎲 5. 凱利公式 (Kelly Criterion)")
+        st.info("**質性解釋：** 資金管理的黃金法則。根據勝率與賠率計算最佳倉位。本系統採用「半凱利 (Half-Kelly)」以降低波動風險。")
+        st.latex(r'''
+        f^* = \frac{p(b+1)-1}{b} \times 0.5
+        ''')
+
+        st.divider()
+
+        # 6. 六維波動
+        st.markdown("#### 🛡️ 6. 六維波動防禦 (Volatility Shells)")
+        st.info("**質性解釋：** 利用標準差 ($\sigma$) 畫出價格的極限邊界。L2 (2倍標準差下緣) 通常是超賣區，適合左側交易抄底。")
+        st.latex(r'''
+        \text{Band} = \mu_{20} \pm (n \times \sigma_{20})
+        ''')
 
 if __name__ == "__main__":
     main()
