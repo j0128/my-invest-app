@@ -4,7 +4,6 @@ import pandas as pd
 import yfinance as yf
 from sklearn.linear_model import LinearRegression
 import plotly.express as px
-import plotly.graph_objects as go
 
 # --- 0. 全局設定 ---
 st.set_page_config(page_title="Alpha 2.0: 戰略資產中控台", layout="wide", page_icon="📈")
@@ -22,47 +21,50 @@ st.markdown("""
 # --- 1. 核心數據引擎 (Data Engine) ---
 @st.cache_data(ttl=3600)
 def fetch_data(tickers):
+    """
+    獲取數據並自動處理 QQQ/QLD/TQQQ/BTC 用於基準對比
+    """
     benchmarks = ['QQQ', 'QLD', 'TQQQ', 'BTC-USD']
     all_tickers = list(set(tickers + benchmarks))
     
     try:
-        # 下載過去 1 年數據 (畫圖不需要太久，1年剛好)
-        data = yf.download(all_tickers, period="1y", auto_adjust=True)
+        # 下載過去 2 年數據 (足夠計算 350DMA)
+        data = yf.download(all_tickers, period="2y", auto_adjust=True)
         
-        # 處理 MultiIndex
+        # 處理 MultiIndex (兼容 yfinance 新舊版)
         if isinstance(data.columns, pd.MultiIndex):
             try:
-                # 這裡我們需要 Open, High, Low, Close 來畫 K 線
-                # 所以不只抓 Close，而是抓整個 DataFrame
-                # 但 yfinance 新版結構比較複雜，我們做一個轉換
-                df_close = data['Close']
-                df_open = data['Open']
-                df_high = data['High']
-                df_low = data['Low']
-                return df_close, df_open, df_high, df_low
+                data = data['Close'] 
             except:
-                return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+                data = data.xs('Close', axis=1, level=0)
         
-        # 舊版兼容 (單一 ticker 可能不會有多層索引，但這裡一定有多個 ticker)
-        return data['Close'], data['Open'], data['High'], data['Low']
+        # 簡單清理：移除完全沒有數據的列
+        data = data.dropna(axis=1, how='all')
+        return data.ffill().dropna()
     except Exception as e:
         st.error(f"數據下載失敗: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
 # --- 2. 核心趨勢模組 (Trend Projection) ---
 def analyze_trend(series):
+    """
+    計算斜率 (k)、效率 (R2)、20EMA 狀態
+    """
     if series.isnull().all(): return None
 
     y = series.values.reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
     
+    # 線性回歸
     model = LinearRegression().fit(x, y)
     k = model.coef_[0].item()
     r2 = model.score(x, y)
     
+    # 價格預測
     p_now = series.iloc[-1]
-    p_1m = model.predict([[len(y) + 22]])[0].item()
+    p_1m = model.predict([[len(y) + 22]])[0].item() # 1個月後
     
+    # 20EMA 狀態判定
     ema20 = series.ewm(span=20).mean().iloc[-1]
     
     if p_now > ema20 and k > 0:
@@ -79,6 +81,9 @@ def analyze_trend(series):
 
 # --- 3. 六維波動防禦 (Volatility Shells) ---
 def calc_volatility_shells(series):
+    """
+    計算 1/2/3 倍標準差的支撐與壓力位
+    """
     window = 20
     rolling_mean = series.rolling(window).mean().iloc[-1]
     rolling_std = series.rolling(window).std().iloc[-1]
@@ -89,242 +94,233 @@ def calc_volatility_shells(series):
         levels[f'H{i}'] = rolling_mean + (i * rolling_std)
         levels[f'L{i}'] = rolling_mean - (i * rolling_std)
         
+    # 判斷當前位置
     pos_desc = "正常波動"
     if curr_price > levels['H2']: pos_desc = "⚠️ 情緒過熱 (H2)"
     if curr_price < levels['L2']: pos_desc = "💎 超賣機會 (L2)"
     
     return levels, pos_desc
 
-# --- 4. 凱利公式 (Kelly) ---
+# --- 4. 凱利公式與持倉建議 (Portfolio Logic) ---
 def calc_kelly_position(trend_data):
+    """
+    基於勝率與賠率計算最佳倉位
+    """
     if not trend_data: return 0, 0
+
+    # 簡單勝率估計：如果趨勢向上 (k>0) 且 R2 高，勝率較高
     win_rate = 0.55
     if trend_data['k'] > 0: win_rate += 0.05
     if trend_data['r2'] > 0.6: win_rate += 0.05
     if trend_data['status'] == "🛑 趨勢損毀": win_rate -= 0.15
-    odds = 2.0 
+    
+    # 賠率 (盈虧比)
+    odds = 2.0 # 默認 2:1
+    
+    # 凱利公式: f* = (bp - q) / b
     f_star = (odds * win_rate - (1 - win_rate)) / odds
+    
+    # 凱利減半 (Half-Kelly) 以策安全
     safe_kelly = max(0, f_star * 0.5) 
+    
     return safe_kelly * 100, win_rate
 
-# --- 5. 繪圖模組 (Plotly K-Line) ---
-def plot_kline_chart(ticker, df_close, df_open, df_high, df_low):
-    """
-    繪製互動式 K 線圖 + 20EMA
-    """
-    if ticker not in df_close.columns: return None
+# --- 5. 外部審計：比特幣逃頂 (Pi Cycle) ---
+def check_pi_cycle(btc_series):
+    if btc_series.empty: return False, 0, 0, 0
     
-    # 準備數據 (取最後 120 天以免圖太擠)
-    lookback = 120
-    dates = df_close.index[-lookback:]
-    opens = df_open[ticker].iloc[-lookback:]
-    highs = df_high[ticker].iloc[-lookback:]
-    lows = df_low[ticker].iloc[-lookback:]
-    closes = df_close[ticker].iloc[-lookback:]
+    ma111 = btc_series.rolling(111).mean().iloc[-1]
+    ma350_x2 = btc_series.rolling(350).mean().iloc[-1] * 2
     
-    # 計算 20EMA 用於疊加
-    ema20 = df_close[ticker].ewm(span=20).mean().iloc[-lookback:]
-
-    fig = go.Figure()
-
-    # K線
-    fig.add_trace(go.Candlestick(
-        x=dates, open=opens, high=highs, low=lows, close=closes,
-        name='Price',
-        increasing_line_color='#00FF7F', decreasing_line_color='#FF4B4B'
-    ))
-
-    # 20EMA 線
-    fig.add_trace(go.Scatter(
-        x=dates, y=ema20, mode='lines', name='20 EMA',
-        line=dict(color='#FFD700', width=1.5)
-    ))
-
-    fig.update_layout(
-        title=f"{ticker} - Daily Chart",
-        height=350,
-        margin=dict(l=0, r=0, t=30, b=0),
-        xaxis_rangeslider_visible=False,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white')
-    )
-    return fig
-
-# --- 6. 績效對比圖 (Normalized Comparison) ---
-def plot_comparison(tickers, df_close):
-    """
-    將所有標的標準化 (歸一化) 進行報酬率對比
-    """
-    lookback = 120 # 比較過去半年
-    df_slice = df_close[tickers].iloc[-lookback:].copy()
+    signal = ma111 > ma350_x2
+    dist = (ma350_x2 - ma111) / ma111 # 距離交叉還有多遠
     
-    # 歸一化：(價格 / 起始價格) - 1
-    df_norm = (df_slice / df_slice.iloc[0]) - 1
-    
-    fig = px.line(df_norm, x=df_norm.index, y=df_norm.columns, 
-                  title="🔥 強弱對決：累積報酬率 (近120天)",
-                  labels={'value': 'ROI', 'variable': 'Ticker'})
-    
-    fig.update_layout(
-        height=400,
-        hovermode="x unified",
-        margin=dict(l=0, r=0, t=30, b=0),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white'),
-        legend=dict(orientation="h", y=1.1)
-    )
-    return fig
+    return signal, ma111, ma350_x2, dist
 
-# --- 7. 輸入解析 ---
+# --- 6. 輸入解析模組 ---
 def parse_input(input_text):
+    """
+    解析側邊欄的 '代號, 金額' 格式
+    """
     portfolio = {}
     lines = input_text.strip().split('\n')
     for line in lines:
         if ',' in line:
             parts = line.split(',')
             ticker = parts[0].strip().upper()
-            try: value = float(parts[1].strip())
-            except: value = 0.0
-            if ticker: portfolio[ticker] = value
+            try:
+                value = float(parts[1].strip())
+            except:
+                value = 0.0
+            if ticker:
+                portfolio[ticker] = value
         else:
+            # 只有代號的情況，預設金額為 0
             ticker = line.strip().upper()
-            if ticker: portfolio[ticker] = 0.0
+            if ticker:
+                portfolio[ticker] = 0.0
     return portfolio
 
-# --- MAIN ---
+# --- MAIN: 儀表板介面 ---
 def main():
     st.title("Alpha 2.0 Pro: 戰略資產中控台")
     st.markdown("---")
 
-    # 側邊欄
+    # --- 側邊欄：資產輸入 ---
     with st.sidebar:
         st.header("⚙️ 資產配置輸入")
-        st.caption("格式：代號, 持倉金額")
+        st.caption("格式：代號, 持倉金額 (換行分隔)")
+        
         default_input = """BTC-USD, 50000
 QQQ, 30000
 BNSOL-USD, 15000
 0050.TW, 20000
 NVDA, 10000"""
+        
         user_input = st.text_area("持倉清單", default_input, height=200)
+        
+        # 解析輸入
         portfolio_dict = parse_input(user_input)
         tickers_list = list(portfolio_dict.keys())
+        
         total_value = sum(portfolio_dict.values())
         st.metric("總資產估值 (Est.)", f"${total_value:,.0f}")
         
         if st.button("🚀 啟動量化審計", type="primary"):
             st.session_state['run_analysis'] = True
         
+    # 如果還沒按按鈕，就停在這
     if not st.session_state.get('run_analysis', False):
-        st.info("👈 請輸入持倉並點擊『啟動量化審計』。")
+        st.info("👈 請在左側輸入您的持倉，並點擊『啟動量化審計』。")
         return
 
-    with st.spinner("Alpha 正在下載 K 線數據並計算模型..."):
-        df_close, df_open, df_high, df_low = fetch_data(tickers_list)
+    # --- 開始分析 ---
+    with st.spinner("Alpha 正在連接交易所數據庫並計算模型..."):
+        df = fetch_data(tickers_list)
             
-    if df_close.empty:
-        st.error("無法獲取數據，請檢查代號。")
+    if df.empty:
+        st.error("無法獲取數據，請檢查代號是否正確。")
         return
 
-    # --- A. 績效對比實驗室 (Performance Lab) ---
-    st.subheader("1. 績效對比實驗室 (Benchmark Lab)")
+    # --- A. 宏觀戰情室 (Macro View) ---
+    st.subheader("1. 宏觀戰情室 (Macro Audit)")
+    col1, col2, col3 = st.columns(3)
     
-    # 1. 報酬率比較圖
-    # 自動加入 QQQ, QLD, TQQQ 到比較列表，並加上用戶前 3 大持倉
-    compare_list = ['QQQ', 'QLD', 'TQQQ'] + tickers_list[:3]
-    # 去重
-    compare_list = list(set(compare_list))
-    # 確保都在 columns 裡
-    valid_compare = [t for t in compare_list if t in df_close.columns]
-    
-    st.plotly_chart(plot_comparison(valid_compare, df_close), use_container_width=True)
-    
-    # 2. 基準 K 線圖 (3欄並排)
-    st.markdown("#### 🇺🇸 美國大盤基準 (Market Context)")
-    b_col1, b_col2, b_col3 = st.columns(3)
-    benchmarks = ['QQQ', 'QLD', 'TQQQ']
-    
-    for i, b_ticker in enumerate(benchmarks):
-        col = [b_col1, b_col2, b_col3][i]
-        with col:
-            if b_ticker in df_close.columns:
-                trend = analyze_trend(df_close[b_ticker])
-                # 標題 + 狀態
-                st.markdown(f"**{b_ticker}** <span style='font-size:0.8em' class='{trend['color']}'>({trend['status']})</span>", unsafe_allow_html=True)
-                # K 線圖
-                fig = plot_kline_chart(b_ticker, df_close, df_open, df_high, df_low)
-                st.plotly_chart(fig, use_container_width=True)
+    # BTC Pi Cycle
+    if 'BTC-USD' in df.columns:
+        pi_sig, ma111, ma350x2, dist = check_pi_cycle(df['BTC-USD'])
+        btc_price = df['BTC-USD'].iloc[-1]
+        
+        with col1:
+            st.markdown("#### ₿ 比特幣逃頂指標")
+            st.metric("BTC 現價", f"${btc_price:,.0f}")
+            if pi_sig:
+                st.error("🚨 逃頂信號已觸發 (Pi Cycle Crossed)!")
+            else:
+                st.success(f"✅ 安全 (距離頂部交叉: {dist:.1%})")
+            st.caption(f"111DMA: {ma111:,.0f} | 350DMAx2: {ma350x2:,.0f}")
+
+    # QQQ 趨勢
+    if 'QQQ' in df.columns:
+        q_trend = analyze_trend(df['QQQ'])
+        with col2:
+            st.markdown("#### 🇺🇸 美股大盤 (QQQ)")
+            st.metric("趨勢狀態", q_trend['status'], delta=f"斜率: {q_trend['k']:.2f}")
+            st.caption(f"R2 (趨勢純度): {q_trend['r2']:.2f}")
+
+    # 槓桿對標
+    if 'TQQQ' in df.columns and 'QQQ' in df.columns:
+        ret_q = df['QQQ'].pct_change().sum()
+        ret_tq = df['TQQQ'].pct_change().sum()
+        with col3:
+            st.markdown("#### ⚡ 槓桿效率")
+            st.metric("TQQQ/QQQ 彈性", f"{ret_tq/ret_q:.2f}x")
+            if ret_tq/ret_q < 2.5:
+                st.warning("⚠️ 槓桿損耗過大 (震盪市)")
+            else:
+                st.success("⚡ 槓桿效率優良")
 
     st.markdown("---")
 
-    # --- B. 資產整合總表 (Portfolio Table) ---
-    st.subheader("2. 資產整合總表")
+    # --- B. 資產整合總表 (Integrated Portfolio) ---
+    st.subheader("2. 資產整合總表 (Portfolio Overview)")
+    
+    # 準備表格數據
     table_data = []
+    
     for ticker in tickers_list:
-        if ticker not in df_close.columns: continue
-        trend = analyze_trend(df_close[ticker])
-        levels, vol_status = calc_volatility_shells(df_close[ticker])
+        if ticker not in df.columns: continue
+        
+        # 獲取各項指標
+        trend = analyze_trend(df[ticker])
+        levels, vol_status = calc_volatility_shells(df[ticker])
         kelly_pct, win_prob = calc_kelly_position(trend)
+        
         current_val = portfolio_dict.get(ticker, 0)
         weight = (current_val / total_value) if total_value > 0 else 0
         
+        # 建議動作邏輯
         action = "持有"
-        if trend['status'] == "🛑 趨勢損毀": action = "減倉"
-        elif vol_status == "💎 超賣機會 (L2)": action = "加倉"
-        elif vol_status == "⚠️ 情緒過熱 (H2)": action = "止盈"
+        if trend['status'] == "🛑 趨勢損毀": action = "減倉/止損"
+        elif vol_status == "💎 超賣機會 (L2)": action = "加倉/抄底"
+        elif vol_status == "⚠️ 情緒過熱 (H2)": action = "止盈觀察"
 
         table_data.append({
             "代號": ticker,
+            "持倉價值": f"${current_val:,.0f}",
             "權重": f"{weight:.1%}",
             "現價": f"${trend['p_now']:.2f}",
             "趨勢": trend['status'],
-            "1M 預測": f"${trend['p_1m']:.2f}",
-            "凱利倉位": f"{kelly_pct:.1f}%",
+            "1個月預測": f"${trend['p_1m']:.2f}",
+            "凱利建議倉位": f"{kelly_pct:.1f}%",
             "六維狀態": vol_status,
             "建議": action
         })
     
-    t_col1, t_col2 = st.columns([2, 1])
-    with t_col1:
+    # 顯示表格與圖表
+    p_col1, p_col2 = st.columns([2, 1])
+    
+    with p_col1:
         st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-    with t_col2:
+    
+    with p_col2:
         if total_value > 0:
             pie_df = pd.DataFrame(list(portfolio_dict.items()), columns=['Ticker', 'Value'])
-            fig = px.pie(pie_df, values='Value', names='Ticker', hole=0.4)
-            fig.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=300)
+            fig = px.pie(pie_df, values='Value', names='Ticker', title='資產配置分布', hole=0.4)
+            fig.update_layout(margin=dict(t=30, b=0, l=0, r=0))
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
 
-    # --- C. 個股深度審計 + K線圖 (Deep Dive) ---
-    st.subheader("3. 持倉 K 線深度審計 (Deep Dive)")
+    # --- C. 個股深度戰術卡片 (Tactical Cards) ---
+    st.subheader("3. 深度戰術審計 (Deep Dive)")
     
-    for ticker in tickers_list:
-        if ticker not in df_close.columns: continue
+    # 這裡只顯示用戶持倉的詳細六維數據
+    cols = st.columns(3)
+    for i, ticker in enumerate(tickers_list):
+        if ticker not in df.columns: continue
         
-        # 使用 Expander 讓版面乾淨，點開才看圖
-        # 標題直接顯示代號和建議動作，增加效率
-        trend = analyze_trend(df_close[ticker])
-        with st.expander(f"📊 {ticker} - {trend['status']} (點擊展開 K 線圖)", expanded=True):
-            k_col1, k_col2 = st.columns([3, 1])
-            
-            with k_col1:
-                # 這裡放 K 線圖
-                fig = plot_kline_chart(ticker, df_close, df_open, df_high, df_low)
-                st.plotly_chart(fig, use_container_width=True)
+        trend = analyze_trend(df[ticker])
+        levels, vol_status = calc_volatility_shells(df[ticker])
+        
+        with cols[i % 3]:
+            with st.container(border=True):
+                st.markdown(f"#### 🎯 {ticker}")
+                st.markdown(f"<span class='{trend['color']}'>{trend['status']}</span>", unsafe_allow_html=True)
                 
-            with k_col2:
-                # 這裡放數據卡片
-                st.markdown("#### 六維數據")
-                levels, vol_status = calc_volatility_shells(df_close[ticker])
-                st.caption(f"H2 (壓力): {levels['H2']:.2f}")
-                st.info(f"現價: {trend['p_now']:.2f}")
-                st.caption(f"L2 (支撐): {levels['L2']:.2f}")
+                # 迷你數據區
+                sub_c1, sub_c2 = st.columns(2)
+                with sub_c1:
+                    st.caption("支撐位 (L2)")
+                    st.markdown(f"**{levels['L2']:.2f}**")
+                with sub_c2:
+                    st.caption("壓力位 (H2)")
+                    st.markdown(f"**{levels['H2']:.2f}**")
                 
-                st.divider()
-                st.markdown("#### Alpha 預測")
-                st.metric("1個月目標", f"${trend['p_1m']:.2f}", delta=f"{(trend['p_1m']-trend['p_now'])/trend['p_now']:.1%}")
+                # 波動區間視覺化 (簡單文字版)
+                st.progress((trend['p_now'] - levels['L3']) / (levels['H3'] - levels['L3']), text=f"區間位置 ({vol_status})")
+                
+                st.caption(f"AI 預測目標: ${trend['p_1m']:.2f}")
 
 if __name__ == "__main__":
     main()
