@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 3.1 Pro: 資金雷達戰情室", layout="wide", page_icon="📡")
+st.set_page_config(page_title="Alpha 3.2 Pro: 資金雷達戰情室", layout="wide", page_icon="📡")
 
 # 自定義 CSS
 st.markdown("""
@@ -18,7 +18,7 @@ st.markdown("""
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
-    .formula-box {background-color: #1E1E1E; padding: 15px; border-radius: 10px; border-left: 5px solid #FFD700;}
+    .backtest-box {background-color: #1E1E1E; padding: 10px; border-radius: 5px; border-left: 5px solid #FF4B4B; margin-top: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -30,7 +30,7 @@ def fetch_market_data(tickers):
     
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
     
-    progress_bar = st.progress(0, text="Alpha 正在計算全時段預測模型...")
+    progress_bar = st.progress(0, text="Alpha 正在執行時光回溯測試...")
     
     for i, t in enumerate(all_tickers):
         try:
@@ -65,35 +65,38 @@ def fetch_fred_liquidity(api_key):
         return df
     except: return None
 
-# --- 工具函數：數字格式化 (K/M) ---
 def format_number(num):
     if num is None: return "N/A"
     abs_num = abs(num)
-    if abs_num >= 1_000_000:
-        return f"{num/1_000_000:.2f}M"
-    elif abs_num >= 1_000:
-        return f"{num/1_000:.2f}K"
-    else:
-        return f"{num:.2f}"
+    if abs_num >= 1_000_000: return f"{num/1_000_000:.2f}M"
+    elif abs_num >= 1_000: return f"{num/1_000:.2f}K"
+    else: return f"{num:.2f}"
 
-# --- 2. 三角定位算法 ---
+# --- 2. 三角定位算法 (含回測邏輯) ---
 
-# A. ATR Target (物理極限)
-def calc_atr_target(close, high, low):
+# A. ATR Target
+def calc_atr_target(close, high, low, slice_idx=-1):
     try:
-        prev_close = close.shift(1)
-        tr = pd.concat([high-low, (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+        # 切片數據到指定時間點
+        c = close.iloc[:slice_idx+1] if slice_idx != -1 else close
+        h = high.iloc[:slice_idx+1] if slice_idx != -1 else high
+        l = low.iloc[:slice_idx+1] if slice_idx != -1 else low
+        
+        prev_close = c.shift(1)
+        tr = pd.concat([h-l, (h-prev_close).abs(), (l-prev_close).abs()], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
-        # 預測一個月 (22天) 的波動極限
+        
+        # 預測 22 天後的極限
         monthly_range = atr * np.sqrt(22) * 1.2 
-        return close.iloc[-1] + monthly_range
+        return c.iloc[-1] + monthly_range
     except: return None
 
-# B. Monte Carlo P50 (統計機率)
-def calc_monte_carlo_target(series, days=22, simulations=1000):
+# B. Monte Carlo P50
+def calc_monte_carlo_target(series, slice_idx=-1, days=22, simulations=500):
     try:
-        returns = series.pct_change().dropna()
-        last_price = series.iloc[-1]
+        s = series.iloc[:slice_idx+1] if slice_idx != -1 else series
+        returns = s.pct_change().dropna()
+        last_price = s.iloc[-1]
         mu = returns.mean()
         sigma = returns.std()
         
@@ -109,19 +112,57 @@ def calc_monte_carlo_target(series, days=22, simulations=1000):
         return np.percentile(final_prices, 50)
     except: return None
 
-# C. Fibonacci 1.618 (群眾心理)
-def calc_fib_target(series):
+# C. Fibonacci 1.618
+def calc_fib_target(series, slice_idx=-1):
     try:
-        recent_window = series.iloc[-60:]
+        s = series.iloc[:slice_idx+1] if slice_idx != -1 else series
+        recent_window = s.iloc[-60:]
         high, low = recent_window.max(), recent_window.min()
         return high + (high - low) * 0.618
     except: return None
 
-# --- 3. 既有模組 ---
+# --- 3. 回測引擎 (New Module) ---
+def run_backtest_lab(ticker, df_close, df_high, df_low):
+    """
+    時光機：回到 22 天前 (約一個月)，計算當時的預測，並與今天比較
+    """
+    if ticker not in df_close.columns or len(df_close) < 250: return None
+    
+    # 1. 設定回測點：22 個交易日前
+    lookback_days = 22 
+    past_idx = len(df_close) - lookback_days - 1
+    
+    past_price = df_close[ticker].iloc[past_idx]
+    current_price = df_close[ticker].iloc[-1]
+    
+    # 2. 用當時數據跑模型
+    pred_atr = calc_atr_target(df_close[ticker], df_high[ticker], df_low[ticker], slice_idx=past_idx)
+    pred_mc = calc_monte_carlo_target(df_close[ticker], slice_idx=past_idx)
+    pred_fib = calc_fib_target(df_close[ticker], slice_idx=past_idx)
+    
+    # 3. 計算誤差
+    def get_error(pred, actual):
+        if not pred: return None, None
+        err_pct = (pred - actual) / actual
+        return pred, err_pct # 負值代表預測低了，正值代表預測高了
+
+    res_atr, err_atr = get_error(pred_atr, current_price)
+    res_mc, err_mc = get_error(pred_mc, current_price)
+    res_fib, err_fib = get_error(pred_fib, current_price)
+    
+    return {
+        "date_past": df_close.index[past_idx].strftime('%Y-%m-%d'),
+        "price_past": past_price,
+        "price_now": current_price,
+        "ATR": (res_atr, err_atr),
+        "MC": (res_mc, err_mc),
+        "Fib": (res_fib, err_fib)
+    }
+
+# --- 4. 既有模組 ---
 def calc_fund_flow(close, high, low, volume):
     if volume is None or volume.empty: return None
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-    
     y = obv.values[-20:].reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
     obv_slope = LinearRegression().fit(x, y).coef_[0].item()
@@ -132,7 +173,6 @@ def calc_fund_flow(close, high, low, volume):
     neg = np.where(typical_price < typical_price.shift(1), money_flow, 0)
     pos_sum = pd.Series(pos).rolling(14).sum().iloc[-1]
     neg_sum = pd.Series(neg).rolling(14).sum().iloc[-1]
-    
     mfi = 100 - (100 / (1 + pos_sum / neg_sum)) if neg_sum != 0 else 100
     return {"obv_slope": obv_slope, "mfi": mfi, "obv_series": obv}
 
@@ -144,8 +184,6 @@ def analyze_trend(series):
     model = LinearRegression().fit(x, y)
     
     p_now = series.iloc[-1].item()
-    
-    # [新增] 三階段預測: 2週(10天), 1月(22天), 3月(66天)
     p_2w = model.predict([[len(y) + 10]])[0].item()
     p_1m = model.predict([[len(y) + 22]])[0].item()
     p_3m = model.predict([[len(y) + 66]])[0].item()
@@ -161,9 +199,7 @@ def analyze_trend(series):
     elif p_now < ema20: status = "⚠️ 動能減弱"
     
     is_overheated = (k > 0 and p_1m < p_now)
-    
-    return {"k": k, "r2": r2, "p_now": p_now, 
-            "p_2w": p_2w, "p_1m": p_1m, "p_3m": p_3m, # 三階段
+    return {"k": k, "r2": r2, "p_now": p_now, "p_2w": p_2w, "p_1m": p_1m, "p_3m": p_3m, 
             "ema20": ema20, "sma200": sma200, "status": status, "is_overheated": is_overheated}
 
 @st.cache_data(ttl=3600*12)
@@ -179,7 +215,6 @@ def calc_volatility_shells(series):
         p = series.iloc[-1]
         levels = {f'H{i}': mean + i*std for i in range(1,4)}
         levels.update({f'L{i}': mean - i*std for i in range(1,4)})
-        
         status = "正常波動"
         if p > levels['H2']: status = "⚠️ 情緒過熱 (H2)"
         if p < levels['L2']: status = "💎 超賣機會 (L2)"
@@ -239,7 +274,7 @@ def parse_input(text):
 # --- MAIN ---
 def main():
     st.title("Alpha 2.0 Pro: 雙引擎資金雷達版")
-    st.caption("v25.0 專業數據版 | 三階段預測 (2W/1M/3M) + 單位優化")
+    st.caption("v26.0 回測驗證版 | 實時檢驗模型誤差率")
     st.markdown("---")
 
     with st.sidebar:
@@ -250,8 +285,8 @@ def main():
         
         st.header("💼 資產配置")
         default_input = """BTC-USD, 10000
-0050.TW, 10000
-AMD, 10000"""
+0050.TW, 1000
+AMD, 1000"""
         user_input = st.text_area("持倉清單", default_input, height=200)
         portfolio_dict = parse_input(user_input)
         tickers_list = list(portfolio_dict.keys())
@@ -263,7 +298,7 @@ AMD, 10000"""
         st.info("👈 請點擊『啟動全域掃描』。")
         return
 
-    with st.spinner("正在執行三角定位與三階段推演..."):
+    with st.spinner("正在執行三角定位與時光回溯測試..."):
         df_close, df_open, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_liquidity = fetch_fred_liquidity(fred_key)
         qqq_pe = get_valuation_metrics('QQQ')
@@ -312,30 +347,44 @@ AMD, 10000"""
         target_atr = calc_atr_target(df_close[ticker], df_high[ticker], df_low[ticker])
         target_mc = calc_monte_carlo_target(df_close[ticker])
         target_fib = calc_fib_target(df_close[ticker])
-        
-        # 使用 format_number 處理 OBV 斜率
         obv_display = format_number(ff['obv_slope'])
+        
+        # 執行回測
+        bt_res = run_backtest_lab(ticker, df_close, df_high, df_low)
         
         with st.expander(f"📡 {ticker} - 資金: {'流入' if ff['obv_slope']>0 else '流出'} | 中樞(MC): ${target_mc:.2f}", expanded=True):
             k1, k2 = st.columns([3, 1])
             with k1:
                 st.plotly_chart(plot_combo_chart(ticker, df_close, df_vol, trend, ff), use_container_width=True, key=f"ff_{ticker}")
             with k2:
-                st.markdown("#### 🎯 1個月三角定位")
+                st.markdown("#### 🎯 三角定位預測")
                 if target_atr: st.write(f"**ATR Target:** ${target_atr:.2f}")
                 if target_mc: st.write(f"**Monte Carlo P50:** ${target_mc:.2f}")
                 if target_fib: st.write(f"**Fibonacci 1.618:** ${target_fib:.2f}")
                 
                 st.divider()
-                st.write("**三階段線性推演:**")
+                st.write("**三階段推演:**")
                 st.caption(f"2週: ${trend['p_2w']:.2f}")
                 st.caption(f"1月: ${trend['p_1m']:.2f}")
                 st.caption(f"3月: ${trend['p_3m']:.2f}")
-                st.divider()
                 
-                # 這裡使用格式化後的數字
-                st.metric("OBV 斜率", obv_display, "吸籌" if ff['obv_slope']>0 else "出貨")
-                st.metric("MFI 資金流", f"{ff['mfi']:.1f}", delta="過熱" if ff['mfi']>80 else "正常", delta_color="inverse")
+                # 回測區塊
+                if bt_res:
+                    st.markdown("#### 🧪 真實回測")
+                    st.caption(f"回測基準日: {bt_res['date_past']}")
+                    st.caption(f"當時股價: ${bt_res['price_past']:.2f}")
+                    st.caption(f"今日現價: ${bt_res['price_now']:.2f}")
+                    
+                    def show_err(name, data):
+                        pred, err = data
+                        if pred:
+                            color = "green" if abs(err) < 0.05 else "red"
+                            st.markdown(f"{name} 誤差: <span style='color:{color}'>{err:.1%}</span>", unsafe_allow_html=True)
+                    
+                    show_err("ATR", bt_res['ATR'])
+                    show_err("MC", bt_res['MC'])
+                    show_err("Fib", bt_res['Fib'])
+
     st.markdown("---")
     
     # --- C. 總表 ---
@@ -359,9 +408,7 @@ AMD, 10000"""
         table_data.append({
             "代號": ticker, "權重": f"{weight:.1%}", "現價": f"${trend['p_now']:.2f}",
             "趨勢": trend['status'], 
-            "2週預測": f"${trend['p_2w']:.2f}", 
-            "1月預測": f"${trend['p_1m']:.2f}",
-            "3月預測": f"${trend['p_3m']:.2f}",
+            "2週預測": f"${trend['p_2w']:.2f}", "1月預測": f"${trend['p_1m']:.2f}", "3月預測": f"${trend['p_3m']:.2f}",
             "資金流": "流入" if ff and ff['obv_slope']>0 else "流出",
             "凱利建議": f"{kelly_pct:.1f}%", "建議": action
         })
@@ -372,16 +419,18 @@ AMD, 10000"""
     # --- D. 白皮書 ---
     st.header("4. 量化模型白皮書 (Quantitative Logic & Formulas)")
     with st.container():
+        st.subheader("🧪 回測實驗室 (Backtest Lab)")
+        st.info("""
+        **運作原理：** 為了驗證模型準確度，系統會自動將時間回撥至 22 個交易日前 (約 1 個月)，使用當時的數據計算三角目標價，並與今天的實際價格進行誤差對比。
+        * **綠色誤差 (<5%)：** 代表該模型對此股票極具參考價值。
+        * **紅色誤差 (>5%)：** 代表該模型近期失準，建議參考其他指標。
+        """)
+        st.divider()
         st.subheader("🎯 價格目標三角定位 (Triangulation Pricing)")
-        st.markdown("本系統採用三種模型進行交叉定位，不再使用形容詞，直接呈現數據本質。")
-        
         c1, c2, c3 = st.columns(3)
-        with c1:
-            st.info("### 1. ATR Target\n**邏輯：物理波動極限**\n\n利用「平均真實波幅」推算一個月內價格在正常能量釋放下能到達的極限。\n\n$$P_{target} = P_{now} + (ATR_{14} \\times \\sqrt{22} \\times 1.2)$$")
-        with c2:
-            st.info("### 2. Monte Carlo P50\n**邏輯：統計機率中樞**\n\n模擬 1000 次隨機漫步 (Geometric Brownian Motion)，取結果的中位數 (P50)，代表統計上機率最高的落點。")
-        with c3:
-            st.info("### 3. Fibonacci 1.618\n**邏輯：群眾心理共識**\n\n基於前波高低點，計算 1.618 黃金分割擴展位，通常是趨勢噴出後的阻力位。\n\n$$P_{target} = H + (H - L) \\times 0.618$$")
+        with c1: st.info("### 1. ATR Target\n**邏輯：物理波動極限**\n$$P_{target} = P_{now} + (ATR_{14} \\times \\sqrt{22} \\times 1.2)$$")
+        with c2: st.info("### 2. Monte Carlo P50\n**邏輯：統計機率中樞**\n模擬 1000 次隨機漫步，取中位數。")
+        with c3: st.info("### 3. Fibonacci 1.618\n**邏輯：群眾心理共識**\n$$P_{target} = H + (H - L) \\times 0.618$$")
     
     st.divider()
     st.markdown("#### 🔮 線性推演 (Linear Projection)")
